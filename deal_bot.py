@@ -1,0 +1,879 @@
+#!/usr/bin/env python3
+"""
+deal_bot.py — pulls electronics/PC-parts deals from Woot, Best Buy, and
+Steam, filters out ones you've already posted or that aren't near their
+own recorded price floor, and sends new ones to Discord via webhooks. Also
+posts an end-of-run digest and auto-posts standout deals to Bluesky.
+
+Designed to run as a single pass per invocation (no persistent process),
+so it fits a GitHub Actions cron schedule or any other external scheduler
+cleanly — see .github/workflows/deal_bot.yml.
+
+STATE
+-----
+All state (seen-deal dedupe, price history, run log) lives in Supabase,
+not on local disk — required for a scheduler like GitHub Actions, where
+every run gets a fresh, empty filesystem. See SUPABASE_URL/SUPABASE_
+SERVICE_KEY below. Tables expected (create these once via the Supabase
+SQL editor):
+  seen_deals    (id text pk, source text, last_seen timestamptz,
+                 sale_price numeric, lowest_price numeric,
+                 lowest_price_date timestamptz)
+  price_history (id bigserial pk, deal_id text, source text,
+                 observed_at timestamptz default now(), sale_price numeric,
+                 list_price numeric, discount_pct numeric)
+  run_log       (id bigserial pk, ran_at timestamptz default now(),
+                 deals_checked int, posted int, skipped_already_seen int,
+                 skipped_no_better_price int, skipped_below_threshold int,
+                 skipped_not_near_historical_low int, digest_sent boolean,
+                 error text)
+
+SETUP
+-----
+1. pip install -r requirements.txt
+2. Create a ".env" file in this folder (see .env.example for the full
+   list of variables) with your real values. Locally, python-dotenv loads
+   it automatically. In GitHub Actions, these are set as repo secrets
+   instead and injected as real environment variables — .env is never
+   committed (see .gitignore) and won't exist at all in that environment,
+   which is fine: load_dotenv() silently does nothing if the file is missing.
+3. Run it: python deal_bot.py
+   - Always runs ONE pass and exits — intended for cron/GitHub Actions.
+   - Pass --loop to keep running and poll every --interval seconds instead,
+     for local testing without a scheduler.
+
+NOTES
+-----
+- Best Buy's query syntax occasionally trips people up. If BESTBUY_SEARCH_
+  TERMS calls start failing, the script prints the raw response so you can
+  cross-check against https://bestbuyapis.github.io/api-documentation/
+- Woot's rate limit is 1 req/sec, burst 10, 1000/day — this script's
+  defaults stay well under that even polling every few minutes.
+- The price-history quality gate (PRICE_HISTORY_MIN_DAYS/PERCENT below)
+  stays dormant for an item until it has that many distinct days of
+  recorded observations — expect it to have no effect for the first few
+  days after this starts running regularly.
+"""
+
+import os
+import time
+import argparse
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
+
+import requests
+from dotenv import load_dotenv
+
+# Loads variables from a .env file (same folder as this script) into the
+# environment. In GitHub Actions there is no .env file — the same names
+# are injected as real environment variables from repo secrets instead,
+# and this call is simply a no-op there.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+# ---------------------------------------------------------------------------
+# CONFIG — values come from the .env file locally, or repo secrets in
+# GitHub Actions (see setup notes above)
+# ---------------------------------------------------------------------------
+WOOT_API_KEY = os.environ.get("WOOT_API_KEY", "")
+BESTBUY_API_KEY = os.environ.get("BESTBUY_API_KEY", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+WOOT_WEBHOOK_URL = os.environ.get("WOOT_WEBHOOK_URL", "")
+BESTBUY_WEBHOOK_URL = os.environ.get("BESTBUY_WEBHOOK_URL", "")
+# Steam's public storefront "Specials" data — no API key needed, this is
+# the same data that powers Steam's own front-page deals section.
+STEAM_WEBHOOK_URL = os.environ.get("STEAM_WEBHOOK_URL", "")
+# Optional: mirrors every deal that posts publicly into a private,
+# owner-only channel — handy as a staging area for manually picking what
+# to share elsewhere. Leave unset to skip this entirely.
+PRIVATE_WEBHOOK_URL = os.environ.get("PRIVATE_WEBHOOK_URL", "")
+# Dedicated channel for the end-of-run digest, separate from the per-deal
+# source channels above.
+DIGEST_WEBHOOK_URL = os.environ.get("DIGEST_WEBHOOK_URL", "")
+
+# Bluesky — free API, no approval process. Only standout deals auto-post
+# here (see BLUESKY_MIN_DISCOUNT_PERCENT below) to avoid looking like a
+# spam firehose on a brand-new account.
+BLUESKY_HANDLE = os.environ.get("BLUESKY_HANDLE", "")
+BLUESKY_APP_PASSWORD = os.environ.get("BLUESKY_APP_PASSWORD", "")
+BLUESKY_MIN_DISCOUNT_PERCENT = int(os.environ.get("BLUESKY_MIN_DISCOUNT_PERCENT", "50"))
+
+# Woot feeds that map to your electronics/gaming focus.
+# Valid options: All, Clearance, Computers, Electronics, Featured, Home,
+# Gourmet, Shirts, Sports, Tools, Wootoff
+WOOT_FEEDS = ["Electronics", "Computers"]
+
+# Woot sometimes cross-lists a "featured" item across every feed regardless
+# of category, so filtering by feed name alone isn't fully reliable. This
+# catches anything with these words in the title and skips it. Add to this
+# list as you spot more off-topic items sneaking through.
+WOOT_EXCLUDE_KEYWORDS = [
+    "squishmallow", "plush", "stuffed animal", "funko",
+    "apparel", "shirt", "hoodie", "sneaker", "shoes",
+    "cookware", "kitchen", "furniture", "decor", "bedding", "mattress",
+]
+
+# Allow-list for the PC-builds/monitors/gaming niche. A Woot deal must match
+# at least one of these (in addition to clearing WOOT_EXCLUDE_KEYWORDS above)
+# to post — this matters because Woot's "Electronics"/"Computers" feeds are
+# broad categories that include plenty of on-category-but-off-brand items
+# (e.g. printers, office gear) that the old exclude-only approach let through.
+WOOT_INCLUDE_KEYWORDS = [
+    "monitor", "display", "gpu", "graphics card", "video card",
+    "motherboard", "cpu", "processor", "ram", "memory", "ssd", "nvme",
+    "hard drive", "power supply", "psu", "pc case", "cpu cooler",
+    "keyboard", "mouse", "mousepad", "headset", "webcam", "microphone",
+    "laptop", "chromebook", "router", "gaming", "controller", "console",
+]
+
+# Woot's feed items carry a "Categories" field — a list of hierarchical
+# strings like ["HOME", "TOOLS", "HOME/Lighting & Fans"]. This rejects
+# whole off-topic departments by their top-level category (the part
+# before the first "/"), as a coarser, less guessable complement to
+# WOOT_EXCLUDE_KEYWORDS above — a new off-topic product line shows up here
+# without needing its own keyword added first.
+WOOT_EXCLUDE_CATEGORIES = [
+    "HOME", "TOOLS", "APPAREL", "TOYS", "SPORTS", "KITCHEN",
+    "AUTOMOTIVE", "GOURMET", "BEAUTY", "PET",
+]
+
+# Best Buy keyword searches — narrowed to match the PC-builds/monitors focus.
+BESTBUY_SEARCH_TERMS = [
+    "monitor", "graphics card", "motherboard", "power supply",
+    "pc case", "ssd", "ram memory", "cpu cooler",
+    "mechanical keyboard", "gaming mouse", "gaming headset",
+    "webcam", "gaming console", "video game",
+]
+
+# Deal-quality thresholds — tunable via .env without editing code.
+MIN_DISCOUNT_PERCENT = int(os.environ.get("MIN_DISCOUNT_PERCENT", "20"))      # ignore anything below this % off
+MIN_DOLLAR_SAVINGS = float(os.environ.get("MIN_DOLLAR_SAVINGS", "10"))        # AND ignore anything saving less than this in real dollars
+SEEN_TTL_DAYS = 45             # forget deals older than this so the table doesn't grow forever
+
+# Price-history quality gate (see PRICE HISTORY section below). A deal
+# needs at least this many DISTINCT CALENDAR DAYS of price_history
+# observations before this gate applies at all — with no real history
+# yet, everything falls back to the discount-vs-list-price check above.
+PRICE_HISTORY_MIN_DAYS = int(os.environ.get("PRICE_HISTORY_MIN_DAYS", "3"))
+# Once there's enough history, the sale price must be within this % of the
+# lowest price ever recorded for that item to count as "near its floor."
+PRICE_HISTORY_TOLERANCE_PERCENT = float(os.environ.get("PRICE_HISTORY_TOLERANCE_PERCENT", "5"))
+
+# ---------------------------------------------------------------------------
+# SEEN-DEAL TRACKING (dedupe across runs) — Supabase-backed.
+# Table: seen_deals (id text pk, source text, last_seen timestamptz,
+# sale_price numeric, lowest_price numeric, lowest_price_date timestamptz)
+# ---------------------------------------------------------------------------
+def _supabase_headers() -> dict:
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def load_seen() -> dict:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return {}
+    url = f"{SUPABASE_URL}/rest/v1/seen_deals?select=id,source,last_seen,sale_price,lowest_price,lowest_price_date"
+    try:
+        # NOTE: PostgREST defaults to capping results (commonly 1000 rows)
+        # with no pagination handled here — fine at today's volume with
+        # SEEN_TTL_DAYS keeping the table bounded, but worth revisiting if
+        # this table grows a lot.
+        resp = requests.get(url, headers=_supabase_headers(), timeout=15)
+    except requests.RequestException as e:
+        print(f"[supabase] load failed: {e}")
+        return {}
+
+    if resp.status_code != 200:
+        print(f"[supabase] load returned {resp.status_code}: {resp.text[:300]}")
+        return {}
+
+    seen = {}
+    for row in resp.json():
+        seen[row["id"]] = {
+            "timestamp": row["last_seen"],
+            "sale_price": row["sale_price"],
+            "lowest_price": row["lowest_price"],
+            "lowest_price_date": row["lowest_price_date"],
+        }
+    return seen
+
+
+def upsert_seen_entry(deal_id: str, source: str, entry: dict) -> None:
+    """Writes one row immediately after a successful post, so a Ctrl+C or
+    later failure doesn't lose it — one row per post rather than
+    rewriting a whole table/file each time."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/seen_deals"
+    headers = _supabase_headers()
+    headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    row = {
+        "id": deal_id,
+        "source": source,
+        "last_seen": entry["timestamp"],
+        "sale_price": entry["sale_price"],
+        "lowest_price": entry["lowest_price"],
+        "lowest_price_date": entry["lowest_price_date"],
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=[row], timeout=15)
+    except requests.RequestException as e:
+        print(f"[supabase] upsert failed for {deal_id}: {e}")
+        return
+    if resp.status_code not in (200, 201, 204):
+        print(f"[supabase] upsert for {deal_id} returned {resp.status_code}: {resp.text[:300]}")
+
+
+def prune_seen(ttl_days: int) -> None:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).isoformat()
+    url = f"{SUPABASE_URL}/rest/v1/seen_deals"
+    try:
+        # Passed via params (not embedded in an f-string URL) so requests
+        # percent-encodes the "+00:00" offset instead of it being read as
+        # a literal space in the query string.
+        resp = requests.delete(
+            url, headers=_supabase_headers(), params={"last_seen": f"lt.{cutoff}"}, timeout=15
+        )
+    except requests.RequestException as e:
+        print(f"[supabase] prune failed: {e}")
+        return
+    if resp.status_code not in (200, 204):
+        print(f"[supabase] prune returned {resp.status_code}: {resp.text[:300]}")
+
+
+# ---------------------------------------------------------------------------
+# PRICE HISTORY — raw observations log, one row per fetched deal per run,
+# whether or not it clears the posting threshold. Backs the quality gate
+# in _process_deals (get_price_history_stats, below) and is also
+# queryable directly in Supabase Studio for trends, e.g.
+#   select min(sale_price), min(observed_at) from price_history
+#   where deal_id = 'woot:...'
+# ---------------------------------------------------------------------------
+def record_price_observations(deals: list[dict]) -> None:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY or not deals:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/price_history"
+    rows = [{
+        "deal_id": d["id"],
+        "source": d["source"],
+        "sale_price": d["sale_price"],
+        "list_price": d["list_price"],
+        "discount_pct": d["discount_pct"],
+    } for d in deals]
+    headers = _supabase_headers()
+    headers["Prefer"] = "return=minimal"
+    try:
+        resp = requests.post(url, headers=headers, json=rows, timeout=30)
+    except requests.RequestException as e:
+        print(f"[supabase] price_history insert failed: {e}")
+        return
+    if resp.status_code not in (200, 201, 204):
+        print(f"[supabase] price_history insert returned {resp.status_code}: {resp.text[:300]}")
+
+
+def get_price_history_stats(deal_id: str) -> tuple[int, float | None]:
+    """Returns (distinct_days_observed, lowest_price_ever_recorded) for a
+    deal ID. Distinct days, not raw row count, on purpose — if this runs
+    frequently, several observations can land on the same day without the
+    retailer's price ever actually changing, which wouldn't tell us
+    anything about real price behavior over time."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return 0, None
+    url = f"{SUPABASE_URL}/rest/v1/price_history"
+    try:
+        resp = requests.get(
+            url, headers=_supabase_headers(),
+            params={"deal_id": f"eq.{deal_id}", "select": "sale_price,observed_at"},
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        print(f"[supabase] price_history stats failed for {deal_id}: {e}")
+        return 0, None
+    if resp.status_code != 200:
+        print(f"[supabase] price_history stats for {deal_id} returned {resp.status_code}: {resp.text[:300]}")
+        return 0, None
+
+    rows = resp.json()
+    if not rows:
+        return 0, None
+    distinct_days = len({row["observed_at"][:10] for row in rows})
+    lowest_price = min(row["sale_price"] for row in rows)
+    return distinct_days, lowest_price
+
+
+# ---------------------------------------------------------------------------
+# RUN LOG — one row per run_once() call, written whether the run succeeds
+# or raises, so run history is visible without needing to watch console
+# output (important since this runs unattended on a GitHub Actions
+# schedule with no console to check).
+# ---------------------------------------------------------------------------
+def log_run(
+    *, deals_checked: int, posted: int, skipped_already_seen: int,
+    skipped_no_better_price: int, skipped_below_threshold: int,
+    skipped_not_near_historical_low: int, digest_sent: bool, error: str | None,
+) -> None:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/run_log"
+    row = {
+        "deals_checked": deals_checked,
+        "posted": posted,
+        "skipped_already_seen": skipped_already_seen,
+        "skipped_no_better_price": skipped_no_better_price,
+        "skipped_below_threshold": skipped_below_threshold,
+        "skipped_not_near_historical_low": skipped_not_near_historical_low,
+        "digest_sent": digest_sent,
+        "error": error,
+    }
+    headers = _supabase_headers()
+    headers["Prefer"] = "return=minimal"
+    try:
+        resp = requests.post(url, headers=headers, json=[row], timeout=15)
+    except requests.RequestException as e:
+        print(f"[supabase] run_log insert failed: {e}")
+        return
+    if resp.status_code not in (200, 201, 204):
+        print(f"[supabase] run_log insert returned {resp.status_code}: {resp.text[:300]}")
+
+
+# ---------------------------------------------------------------------------
+# WOOT
+# ---------------------------------------------------------------------------
+def fetch_woot_feed(feed_name: str) -> list[dict]:
+    if not WOOT_API_KEY:
+        return []
+    url = f"https://developer.woot.com/feed/{feed_name}"
+    headers = {"Accept": "application/json", "x-api-key": WOOT_API_KEY}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+    except requests.RequestException as e:
+        print(f"[woot] request failed for feed '{feed_name}': {e}")
+        return []
+
+    if resp.status_code != 200:
+        print(f"[woot] feed '{feed_name}' returned {resp.status_code}: {resp.text[:300]}")
+        return []
+
+    items = resp.json().get("Items", [])
+    deals = []
+    for item in items:
+        if item.get("IsSoldOut"):
+            continue
+        title = item.get("Title", "")
+        if any(kw in title.lower() for kw in WOOT_EXCLUDE_KEYWORDS):
+            continue
+        if not any(kw in title.lower() for kw in WOOT_INCLUDE_KEYWORDS):
+            continue
+        top_level_categories = {
+            c.split("/")[0].strip().upper() for c in (item.get("Categories") or [])
+        }
+        if top_level_categories & {c.upper() for c in WOOT_EXCLUDE_CATEGORIES}:
+            continue
+        sale = (item.get("SalePrice") or {}).get("Minimum")
+        list_price = (item.get("ListPrice") or {}).get("Minimum")
+        if sale is None:
+            continue
+        discount_pct = None
+        if list_price:
+            discount_pct = round((list_price - sale) / list_price * 100, 1)
+        deals.append({
+            "id": f"woot:{item.get('OfferId')}",
+            "source": "Woot",
+            "title": title,
+            "url": item.get("Url"),
+            "image": item.get("Photo"),
+            "list_price": list_price,
+            "sale_price": sale,
+            "discount_pct": discount_pct,
+        })
+    return deals
+
+
+# ---------------------------------------------------------------------------
+# BEST BUY
+# ---------------------------------------------------------------------------
+def fetch_bestbuy_search(term: str) -> list[dict]:
+    if not BESTBUY_API_KEY:
+        return []
+    fields = "sku,name,salePrice,regularPrice,url,image,onSale"
+    query = quote(f"search={term}&onSale=true")
+    url = (
+        f"https://api.bestbuy.com/v1/products({query})"
+        f"?apiKey={BESTBUY_API_KEY}&format=json&show={fields}&pageSize=20"
+    )
+    try:
+        resp = requests.get(url, timeout=15)
+    except requests.RequestException as e:
+        print(f"[bestbuy] request failed for term '{term}': {e}")
+        return []
+
+    if resp.status_code != 200:
+        print(f"[bestbuy] search '{term}' returned {resp.status_code}: {resp.text[:300]}")
+        return []
+
+    products = resp.json().get("products", [])
+    deals = []
+    for p in products:
+        sale = p.get("salePrice")
+        regular = p.get("regularPrice")
+        if not sale or not regular or regular <= 0:
+            continue
+        discount_pct = round((regular - sale) / regular * 100, 1)
+        deals.append({
+            "id": f"bestbuy:{p.get('sku')}",
+            "source": "Best Buy",
+            "title": p.get("name"),
+            "url": p.get("url"),
+            "image": p.get("image"),
+            "list_price": regular,
+            "sale_price": sale,
+            "discount_pct": discount_pct,
+        })
+    return deals
+
+
+# ---------------------------------------------------------------------------
+# STEAM
+# ---------------------------------------------------------------------------
+def fetch_steam_specials() -> list[dict]:
+    """Pulls Steam's public "Specials" storefront category — this is the
+    same public, no-key-required endpoint that powers Steam's own front
+    page. It surfaces Valve's curated front-page picks rather than every
+    discounted game on the platform, so expect a modest, curated list
+    rather than a huge catalog dump."""
+    url = "https://store.steampowered.com/api/featuredcategories?cc=us&l=en"
+    try:
+        resp = requests.get(url, timeout=15)
+    except requests.RequestException as e:
+        print(f"[steam] request failed: {e}")
+        return []
+
+    if resp.status_code != 200:
+        print(f"[steam] returned {resp.status_code}: {resp.text[:300]}")
+        return []
+
+    items = resp.json().get("specials", {}).get("items", [])
+    deals = []
+    for item in items:
+        appid = item.get("id")
+        final_cents = item.get("final_price")
+        original_cents = item.get("original_price")
+        if appid is None or final_cents is None:
+            continue
+        sale = final_cents / 100
+        list_price = (original_cents / 100) if original_cents else None
+        deals.append({
+            "id": f"steam:{appid}",
+            "source": "Steam",
+            "title": item.get("name", "Unknown Game"),
+            "url": f"https://store.steampowered.com/app/{appid}/",
+            "image": item.get("large_capsule_image") or item.get("header_image"),
+            "list_price": list_price,
+            "sale_price": sale,
+            "discount_pct": item.get("discount_percent"),
+        })
+    return deals
+
+
+# ---------------------------------------------------------------------------
+# DISCORD
+# ---------------------------------------------------------------------------
+# Set True to show a large image instead of a small thumbnail — bigger and
+# more eye-catching, but takes up more vertical space per post.
+EMBED_USE_LARGE_IMAGE = False
+
+
+def build_embed(deal: dict) -> dict:
+    discount = deal["discount_pct"]
+
+    # Color-code by deal quality, and flag standout deals in the title.
+    if discount is not None and discount >= 50:
+        color = 0xE74C3C  # red — hot deal
+        title = f"🔥 {deal['title'][:245]}"
+    elif discount is not None and discount >= 35:
+        color = 0x2ECC71  # green — great deal
+        title = f"✅ {deal['title'][:245]}"
+    else:
+        color = 0x3498DB  # blue — solid deal
+        title = deal["title"][:250]
+
+    price_value = f"**${deal['sale_price']:.2f}**"
+    if deal["list_price"]:
+        price_value += f"  ~~${deal['list_price']:.2f}~~"
+
+    fields = [{"name": "Price", "value": price_value, "inline": True}]
+    if discount is not None:
+        fields.append({"name": "Discount", "value": f"{discount}% off", "inline": True})
+    if deal["list_price"]:
+        savings = deal["list_price"] - deal["sale_price"]
+        fields.append({"name": "You Save", "value": f"${savings:.2f}", "inline": True})
+
+    # Price-history context, based on prior posts of this exact deal ID
+    # (see _process_deals) — only set when we have prior data.
+    if deal.get("is_new_low"):
+        fields.append({"name": "Price History", "value": "🏆 New record low!", "inline": True})
+    elif deal.get("lowest_price") is not None and deal["lowest_price"] < deal["sale_price"]:
+        low_date = (deal.get("lowest_price_date") or "")[:10] or "?"
+        fields.append({
+            "name": "Lowest Seen",
+            "value": f"${deal['lowest_price']:.2f} ({low_date})",
+            "inline": True,
+        })
+
+    embed = {
+        "title": title,
+        "url": deal["url"],
+        "color": color,
+        "fields": fields,
+        "footer": {"text": deal["source"]},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if deal.get("image"):
+        key = "image" if EMBED_USE_LARGE_IMAGE else "thumbnail"
+        embed[key] = {"url": deal["image"]}
+    return embed
+
+
+# Fixed display order for the digest's per-source fields — sources with
+# nothing posted this run are simply left out.
+DIGEST_SOURCE_ORDER = ["Woot", "Best Buy", "Steam"]
+
+
+def build_digest_embed(stats: dict) -> dict:
+    """stats: {source_name: {"count": int, "total_savings": float,
+    "best": {"title": str, "url": str, "discount_pct": float} | None}}"""
+    total_count = sum(s["count"] for s in stats.values())
+    total_savings = sum(s["total_savings"] for s in stats.values())
+
+    fields = []
+    for source in DIGEST_SOURCE_ORDER:
+        s = stats.get(source)
+        if not s or s["count"] == 0:
+            continue
+        value = f"{s['count']} posted, ${s['total_savings']:.2f} saved"
+        best = s.get("best")
+        if best:
+            discount_str = f" ({best['discount_pct']}% off)" if best["discount_pct"] is not None else ""
+            value += f"\nBest: [{best['title'][:80]}]({best['url']}){discount_str}"
+        fields.append({"name": source, "value": value, "inline": False})
+
+    return {
+        "title": "📊 Deal Digest",
+        "description": f"{total_count} deals posted this run · ${total_savings:.2f} saved total",
+        "color": 0x9B59B6,
+        "fields": fields,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _post_webhook(webhook_url: str, payload: dict, label: str) -> bool:
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(webhook_url, json=payload, timeout=10)
+        except requests.RequestException as e:
+            print(f"[discord:{label}] post failed: {e}")
+            return False
+
+        if resp.status_code in (200, 204):
+            return True
+
+        if resp.status_code == 429:
+            retry_after = resp.json().get("retry_after", 1)
+            wait = float(retry_after) + 0.25  # small buffer past what Discord asks for
+            print(f"[discord:{label}] rate limited, waiting {wait:.2f}s (attempt {attempt}/{max_retries})")
+            time.sleep(wait)
+            continue
+
+        print(f"[discord:{label}] webhook returned {resp.status_code}: {resp.text[:300]}")
+        return False
+
+    print(f"[discord:{label}] gave up after repeated rate limits")
+    return False
+
+
+def build_x_caption(deal: dict) -> str:
+    """Plain-text, X-ready caption. No markdown — X doesn't render it.
+    Trim manually before posting if it runs long; titles vary in length
+    so this can't guarantee staying under X's character limit."""
+    discount = f"{deal['discount_pct']}% off" if deal["discount_pct"] else "On sale"
+    price = f"${deal['sale_price']:.2f}"
+    if deal["list_price"]:
+        price += f" (was ${deal['list_price']:.2f})"
+    return f"{discount} — {deal['title']} — {price}\n{deal['url']}"
+
+
+SOURCE_WEBHOOKS = {
+    "Woot": WOOT_WEBHOOK_URL,
+    "Best Buy": BESTBUY_WEBHOOK_URL,
+    "Steam": STEAM_WEBHOOK_URL,
+}
+
+
+def post_to_discord(deal: dict) -> bool:
+    webhook_url = SOURCE_WEBHOOKS.get(deal["source"], "")
+    if not webhook_url:
+        print(f"[discord] no webhook URL set for {deal['source']} — skipping post")
+        return False
+
+    embed = build_embed(deal)
+    success = _post_webhook(webhook_url, {"embeds": [embed]}, deal["source"].lower())
+
+    # Best-effort mirror to the private review channel — its failure
+    # shouldn't block the public post from counting as successful.
+    if success and PRIVATE_WEBHOOK_URL:
+        time.sleep(0.5)
+        _post_webhook(PRIVATE_WEBHOOK_URL, {"embeds": [embed]}, "private")
+
+        time.sleep(0.5)
+        caption = build_x_caption(deal)
+        # Code-block formatting gives you a one-click copy icon on hover
+        # in the Discord client — no bot/buttons needed for that.
+        _post_webhook(PRIVATE_WEBHOOK_URL, {"content": f"```{caption}```"}, "private-caption")
+
+    return success
+
+
+# ---------------------------------------------------------------------------
+# BLUESKY
+# ---------------------------------------------------------------------------
+_bluesky_session = None  # cached for the duration of one run, avoids re-login per post
+
+
+def _bluesky_login() -> dict | None:
+    global _bluesky_session
+    if _bluesky_session:
+        return _bluesky_session
+    if not BLUESKY_HANDLE or not BLUESKY_APP_PASSWORD:
+        return None
+    try:
+        resp = requests.post(
+            "https://bsky.social/xrpc/com.atproto.server.createSession",
+            json={"identifier": BLUESKY_HANDLE, "password": BLUESKY_APP_PASSWORD},
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[bluesky] login failed: {e}")
+        return None
+    _bluesky_session = resp.json()
+    return _bluesky_session
+
+
+def post_to_bluesky(deal: dict) -> bool:
+    session = _bluesky_login()
+    if not session:
+        return False
+
+    text = build_x_caption(deal)  # plain text, no markdown — works for Bluesky too
+    if len(text) > 300:  # Bluesky's post length limit
+        text = text[:296] + "…"
+
+    record = {
+        "$type": "app.bsky.feed.post",
+        "text": text,
+        "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    try:
+        resp = requests.post(
+            "https://bsky.social/xrpc/com.atproto.repo.createRecord",
+            headers={"Authorization": f"Bearer {session['accessJwt']}"},
+            json={"repo": session["did"], "collection": "app.bsky.feed.post", "record": record},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        print(f"[bluesky] post failed: {e}")
+        return False
+
+    if resp.status_code != 200:
+        print(f"[bluesky] post returned {resp.status_code}: {resp.text[:300]}")
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+def run_once() -> None:
+    seen = load_seen()
+    all_deals = []
+    new_count = 0
+    skipped_already_seen = 0
+    skipped_no_better_price = 0
+    skipped_below_threshold = 0
+    skipped_not_near_historical_low = 0
+    digest_sent = False
+    # Tallied in-memory for the end-of-run digest — no need to persist
+    # "source" into seen_deals since the digest only covers this single
+    # run, not a longer window.
+    digest_stats = {source: {"count": 0, "total_savings": 0.0, "best": None} for source in DIGEST_SOURCE_ORDER}
+
+    # Everything below is wrapped so a run_log row gets written even if
+    # something raises partway through — otherwise a crashed run would
+    # leave no record at all, just a red X in the Actions tab.
+    try:
+        for feed in WOOT_FEEDS:
+            all_deals.extend(fetch_woot_feed(feed))
+            time.sleep(1.1)  # stay comfortably under Woot's 1 req/sec limit
+
+        for term in BESTBUY_SEARCH_TERMS:
+            all_deals.extend(fetch_bestbuy_search(term))
+            time.sleep(0.3)
+
+        all_deals.extend(fetch_steam_specials())  # single request, no loop needed
+
+        # Log a price observation for every fetched deal, not just ones
+        # that end up posting — see the PRICE HISTORY section.
+        record_price_observations(all_deals)
+
+        (new_count, skipped_already_seen, skipped_no_better_price, skipped_below_threshold,
+         skipped_not_near_historical_low, digest_sent) = _process_deals(all_deals, seen, digest_stats)
+    except Exception as e:
+        log_run(
+            deals_checked=len(all_deals), posted=new_count,
+            skipped_already_seen=skipped_already_seen,
+            skipped_no_better_price=skipped_no_better_price,
+            skipped_below_threshold=skipped_below_threshold,
+            skipped_not_near_historical_low=skipped_not_near_historical_low,
+            digest_sent=digest_sent, error=str(e),
+        )
+        raise
+    else:
+        log_run(
+            deals_checked=len(all_deals), posted=new_count,
+            skipped_already_seen=skipped_already_seen,
+            skipped_no_better_price=skipped_no_better_price,
+            skipped_below_threshold=skipped_below_threshold,
+            skipped_not_near_historical_low=skipped_not_near_historical_low,
+            digest_sent=digest_sent, error=None,
+        )
+
+
+def _process_deals(all_deals: list[dict], seen: dict, digest_stats: dict) -> tuple[int, int, int, int, int, bool]:
+    """The main posting loop, split out so run_once() can wrap it in a
+    single try/except for log_run without one giant indented block.
+    Returns (new_count, skipped_already_seen, skipped_no_better_price,
+    skipped_below_threshold, skipped_not_near_historical_low, digest_sent)."""
+    new_count = 0
+    skipped_already_seen = 0
+    skipped_no_better_price = 0
+    skipped_below_threshold = 0
+    skipped_not_near_historical_low = 0
+
+    for deal in all_deals:
+        prior = seen.get(deal["id"])
+        if prior:
+            prior_price = prior.get("sale_price")
+            if prior_price is None:
+                skipped_already_seen += 1
+                continue
+            if deal["sale_price"] >= prior_price - MIN_DOLLAR_SAVINGS:
+                skipped_no_better_price += 1
+                continue
+        if deal["discount_pct"] is None or deal["discount_pct"] < MIN_DISCOUNT_PERCENT:
+            skipped_below_threshold += 1
+            continue
+        if deal["list_price"] and (deal["list_price"] - deal["sale_price"]) < MIN_DOLLAR_SAVINGS:
+            skipped_below_threshold += 1
+            continue
+
+        # Price-history quality gate. Discount off the retailer's listed
+        # price is a weak signal on its own (list prices get inflated) —
+        # once there's enough real history for this exact item, require
+        # the sale price to actually be near its own recorded floor, not
+        # just far from a number the retailer picked. Dormant until
+        # PRICE_HISTORY_MIN_DAYS of distinct-day history exists for a
+        # given deal_id — see get_price_history_stats().
+        history_days, history_low = get_price_history_stats(deal["id"])
+        if history_days >= PRICE_HISTORY_MIN_DAYS and history_low is not None:
+            ceiling = history_low * (1 + PRICE_HISTORY_TOLERANCE_PERCENT / 100)
+            if deal["sale_price"] > ceiling:
+                skipped_not_near_historical_low += 1
+                continue
+
+        # Price-history tracking for the embed badge. We only know about
+        # prices from runs where this deal actually posted (below-
+        # threshold prices are never recorded here), so "lowest seen"
+        # means "lowest we've ever alerted on," not the item's true
+        # all-time floor (that's what price_history above is for).
+        prior_lowest = (prior or {}).get("lowest_price")
+        is_new_low = prior_lowest is not None and deal["sale_price"] <= prior_lowest
+        if prior_lowest is not None and prior_lowest < deal["sale_price"]:
+            deal["lowest_price"] = prior_lowest
+            deal["lowest_price_date"] = prior.get("lowest_price_date")
+        else:
+            deal["lowest_price"] = deal["sale_price"]
+            deal["lowest_price_date"] = datetime.now(timezone.utc).isoformat()
+        deal["is_new_low"] = is_new_low
+
+        if post_to_discord(deal):
+            seen[deal["id"]] = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "sale_price": deal["sale_price"],
+                "lowest_price": deal["lowest_price"],
+                "lowest_price_date": deal["lowest_price_date"],
+            }
+            upsert_seen_entry(deal["id"], deal["source"], seen[deal["id"]])  # write immediately so a Ctrl+C or later failure doesn't lose this
+            new_count += 1
+            time.sleep(2)  # be gentle with the Discord webhook rate limit
+
+            source_stats = digest_stats.setdefault(deal["source"], {"count": 0, "total_savings": 0.0, "best": None})
+            source_stats["count"] += 1
+            if deal["list_price"]:
+                source_stats["total_savings"] += deal["list_price"] - deal["sale_price"]
+            best = source_stats["best"]
+            if best is None or (deal["discount_pct"] or 0) > (best["discount_pct"] or 0):
+                source_stats["best"] = {
+                    "title": deal["title"],
+                    "url": deal["url"],
+                    "discount_pct": deal["discount_pct"],
+                }
+
+            if deal["discount_pct"] is not None and deal["discount_pct"] >= BLUESKY_MIN_DISCOUNT_PERCENT:
+                if post_to_bluesky(deal):
+                    print(f"[bluesky] posted: {deal['title'][:60]}")
+                time.sleep(1)
+
+    prune_seen(SEEN_TTL_DAYS)
+    print(
+        f"[run] checked {len(all_deals)} deals — "
+        f"{new_count} posted, "
+        f"{skipped_already_seen} already posted at this price or better, "
+        f"{skipped_no_better_price} same item but not enough of a price drop, "
+        f"{skipped_below_threshold} below the discount/savings threshold, "
+        f"{skipped_not_near_historical_low} not near their historical low"
+    )
+
+    # Only send a digest when there's something to report — an empty
+    # "0 posted" message every run would just be noise.
+    digest_sent = False
+    if new_count > 0 and DIGEST_WEBHOOK_URL:
+        digest_sent = _post_webhook(DIGEST_WEBHOOK_URL, {"embeds": [build_digest_embed(digest_stats)]}, "digest")
+
+    return (new_count, skipped_already_seen, skipped_no_better_price, skipped_below_threshold,
+            skipped_not_near_historical_low, digest_sent)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--loop", action="store_true", help="keep running instead of a single pass (local testing only — GitHub Actions uses its own schedule)")
+    parser.add_argument("--interval", type=int, default=1800, help="seconds between polls when --loop is set")
+    args = parser.parse_args()
+
+    if args.loop:
+        while True:
+            run_once()
+            time.sleep(args.interval)
+    else:
+        run_once()
+
+
+if __name__ == "__main__":
+    main()

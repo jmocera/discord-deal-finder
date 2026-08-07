@@ -1,0 +1,42 @@
+name: deal-bot
+
+on:
+  schedule:
+    # Every 30 minutes, matching the old --interval 1800 default. GitHub
+    # doesn't guarantee exact timing on schedule triggers (can lag a few
+    # minutes under load), which doesn't matter for this use case. Adjust
+    # the cadence here if you want it more/less frequent.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}  # lets you trigger a run manually from the Actions tab
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - run: pip install -r requirements.txt
+
+      - run: python deal_bot.py
+        env:
+          WOOT_API_KEY: ${{ secrets.WOOT_API_KEY }}
+          BESTBUY_API_KEY: ${{ secrets.BESTBUY_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          WOOT_WEBHOOK_URL: ${{ secrets.WOOT_WEBHOOK_URL }}
+          BESTBUY_WEBHOOK_URL: ${{ secrets.BESTBUY_WEBHOOK_URL }}
+          STEAM_WEBHOOK_URL: ${{ secrets.STEAM_WEBHOOK_URL }}
+          PRIVATE_WEBHOOK_URL: ${{ secrets.PRIVATE_WEBHOOK_URL }}
+          DIGEST_WEBHOOK_URL: ${{ secrets.DIGEST_WEBHOOK_URL }}
+          BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
+          BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
+          MIN_DISCOUNT_PERCENT: ${{ secrets.MIN_DISCOUNT_PERCENT }}
+          MIN_DOLLAR_SAVINGS: ${{ secrets.MIN_DOLLAR_SAVINGS }}
+          BLUESKY_MIN_DISCOUNT_PERCENT: ${{ secrets.BLUESKY_MIN_DISCOUNT_PERCENT }}
+          PRICE_HISTORY_MIN_DAYS: ${{ secrets.PRICE_HISTORY_MIN_DAYS }}
+          PRICE_HISTORY_TOLERANCE_PERCENT: ${{ secrets.PRICE_HISTORY_TOLERANCE_PERCENT }}
