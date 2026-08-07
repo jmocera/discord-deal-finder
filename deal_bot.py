@@ -680,9 +680,12 @@ def post_to_discord(deal: dict) -> bool:
 
         time.sleep(0.5)
         caption = build_x_caption(deal)
+        # X's real limit is 280 chars — flagged, not auto-trimmed, since
+        # you're copying this by hand and can judge how best to cut it.
+        warning = f"⚠️ {len(caption)} chars — over X's 280 limit, trim before posting\n" if len(caption) > 280 else ""
         # Code-block formatting gives you a one-click copy icon on hover
         # in the Discord client — no bot/buttons needed for that.
-        _post_webhook(PRIVATE_WEBHOOK_URL, {"content": f"```{caption}```"}, "private-caption")
+        _post_webhook(PRIVATE_WEBHOOK_URL, {"content": f"{warning}```{caption}```"}, "private-caption")
 
     return success
 
