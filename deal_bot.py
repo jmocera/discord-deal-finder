@@ -92,6 +92,10 @@ PRIVATE_WEBHOOK_URL = os.environ.get("PRIVATE_WEBHOOK_URL", "")
 # Dedicated channel for the end-of-run digest, separate from the per-deal
 # source channels above.
 DIGEST_WEBHOOK_URL = os.environ.get("DIGEST_WEBHOOK_URL", "")
+# Dedicated channel that mirrors every run_log row (see log_run below) —
+# posts every run, success or failure, so a crash is actually visible
+# somewhere instead of only being a silent row in Supabase.
+RUN_LOG_WEBHOOK_URL = os.environ.get("RUN_LOG_WEBHOOK_URL", "")
 
 # Bluesky — free API, no approval process. Only standout deals auto-post
 # here (see BLUESKY_MIN_DISCOUNT_PERCENT below) to avoid looking like a
@@ -312,35 +316,47 @@ def get_price_history_stats(deal_id: str) -> tuple[int, float | None]:
 # RUN LOG — one row per run_once() call, written whether the run succeeds
 # or raises, so run history is visible without needing to watch console
 # output (important since this runs unattended on a GitHub Actions
-# schedule with no console to check).
+# schedule with no console to check). Also mirrored to a Discord channel
+# via RUN_LOG_WEBHOOK_URL, if set, so a failure is visible somewhere you'll
+# actually notice rather than only being a queryable row in Supabase.
 # ---------------------------------------------------------------------------
 def log_run(
     *, deals_checked: int, posted: int, skipped_already_seen: int,
     skipped_no_better_price: int, skipped_below_threshold: int,
     skipped_not_near_historical_low: int, digest_sent: bool, error: str | None,
 ) -> None:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        return
-    url = f"{SUPABASE_URL}/rest/v1/run_log"
-    row = {
-        "deals_checked": deals_checked,
-        "posted": posted,
-        "skipped_already_seen": skipped_already_seen,
-        "skipped_no_better_price": skipped_no_better_price,
-        "skipped_below_threshold": skipped_below_threshold,
-        "skipped_not_near_historical_low": skipped_not_near_historical_low,
-        "digest_sent": digest_sent,
-        "error": error,
-    }
-    headers = _supabase_headers()
-    headers["Prefer"] = "return=minimal"
-    try:
-        resp = requests.post(url, headers=headers, json=[row], timeout=15)
-    except requests.RequestException as e:
-        print(f"[supabase] run_log insert failed: {e}")
-        return
-    if resp.status_code not in (200, 201, 204):
-        print(f"[supabase] run_log insert returned {resp.status_code}: {resp.text[:300]}")
+    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+        url = f"{SUPABASE_URL}/rest/v1/run_log"
+        row = {
+            "deals_checked": deals_checked,
+            "posted": posted,
+            "skipped_already_seen": skipped_already_seen,
+            "skipped_no_better_price": skipped_no_better_price,
+            "skipped_below_threshold": skipped_below_threshold,
+            "skipped_not_near_historical_low": skipped_not_near_historical_low,
+            "digest_sent": digest_sent,
+            "error": error,
+        }
+        headers = _supabase_headers()
+        headers["Prefer"] = "return=minimal"
+        try:
+            resp = requests.post(url, headers=headers, json=[row], timeout=15)
+        except requests.RequestException as e:
+            print(f"[supabase] run_log insert failed: {e}")
+            resp = None
+        if resp is not None and resp.status_code not in (200, 201, 204):
+            print(f"[supabase] run_log insert returned {resp.status_code}: {resp.text[:300]}")
+
+    if RUN_LOG_WEBHOOK_URL:
+        embed = build_run_log_embed(
+            deals_checked=deals_checked, posted=posted,
+            skipped_already_seen=skipped_already_seen,
+            skipped_no_better_price=skipped_no_better_price,
+            skipped_below_threshold=skipped_below_threshold,
+            skipped_not_near_historical_low=skipped_not_near_historical_low,
+            digest_sent=digest_sent, error=error,
+        )
+        _post_webhook(RUN_LOG_WEBHOOK_URL, {"embeds": [embed]}, "run-log")
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +584,36 @@ def build_digest_embed(stats: dict) -> dict:
         "title": "📊 Deal Digest",
         "description": f"{total_count} deals posted this run · ${total_savings:.2f} saved total",
         "color": 0x9B59B6,
+        "fields": fields,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def build_run_log_embed(
+    *, deals_checked: int, posted: int, skipped_already_seen: int,
+    skipped_no_better_price: int, skipped_below_threshold: int,
+    skipped_not_near_historical_low: int, digest_sent: bool, error: str | None,
+) -> dict:
+    if error:
+        title, color = "❌ Run failed", 0xE74C3C
+    else:
+        title, color = "✅ Run completed", 0x2ECC71
+
+    fields = [
+        {"name": "Checked", "value": str(deals_checked), "inline": True},
+        {"name": "Posted", "value": str(posted), "inline": True},
+        {"name": "Digest sent", "value": "yes" if digest_sent else "no", "inline": True},
+        {"name": "Already seen", "value": str(skipped_already_seen), "inline": True},
+        {"name": "No better price", "value": str(skipped_no_better_price), "inline": True},
+        {"name": "Below threshold", "value": str(skipped_below_threshold), "inline": True},
+        {"name": "Not near historical low", "value": str(skipped_not_near_historical_low), "inline": True},
+    ]
+    if error:
+        fields.append({"name": "Error", "value": error[:500], "inline": False})
+
+    return {
+        "title": title,
+        "color": color,
         "fields": fields,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
