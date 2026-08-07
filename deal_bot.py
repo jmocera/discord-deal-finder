@@ -98,11 +98,13 @@ DIGEST_WEBHOOK_URL = os.environ.get("DIGEST_WEBHOOK_URL", "")
 RUN_LOG_WEBHOOK_URL = os.environ.get("RUN_LOG_WEBHOOK_URL", "")
 
 # Bluesky — free API, no approval process. Only standout deals auto-post
-# here (see BLUESKY_MIN_DISCOUNT_PERCENT below) to avoid looking like a
-# spam firehose on a brand-new account.
+# here (see BLUESKY_MIN_DISCOUNT_PERCENT below), and even among those,
+# only the top BLUESKY_MAX_POSTS_PER_RUN by $ saved actually go out — to
+# avoid looking like a spam firehose on a brand-new account.
 BLUESKY_HANDLE = os.environ.get("BLUESKY_HANDLE", "")
 BLUESKY_APP_PASSWORD = os.environ.get("BLUESKY_APP_PASSWORD", "")
 BLUESKY_MIN_DISCOUNT_PERCENT = int(os.environ.get("BLUESKY_MIN_DISCOUNT_PERCENT", "50"))
+BLUESKY_MAX_POSTS_PER_RUN = int(os.environ.get("BLUESKY_MAX_POSTS_PER_RUN", "2"))
 
 # Woot feeds that map to your electronics/gaming focus.
 # Valid options: All, Clearance, Computers, Electronics, Featured, Home,
@@ -838,6 +840,8 @@ def _process_deals(
     single try/except for log_run without one giant indented block.
     Mutates `stats` (new_count, skipped_*, digest_sent) in place rather
     than returning at the end — see the comment in run_once()."""
+    bluesky_candidates = []  # collected here, ranked and capped after the loop
+
     for deal in all_deals:
         prior = seen.get(deal["id"])
         if prior:
@@ -908,10 +912,17 @@ def _process_deals(
                     "discount_pct": deal["discount_pct"],
                 }
 
-            if deal["discount_pct"] is not None and deal["discount_pct"] >= BLUESKY_MIN_DISCOUNT_PERCENT:
-                if post_to_bluesky(deal):
-                    print(f"[bluesky] posted: {deal['title'][:60]}")
-                time.sleep(1)
+            # Bluesky candidacy only — actual posting happens after the
+            # loop, capped to the top BLUESKY_MAX_POSTS_PER_RUN by $ saved.
+            # Posting every qualifying deal immediately as it's found,
+            # uncapped, is exactly the "spam firehose on a new account"
+            # this threshold was meant to avoid. Requires a known list
+            # price to rank by savings — the rare deal without one is
+            # excluded from Bluesky consideration (still posts to Discord
+            # as normal).
+            if (deal["discount_pct"] is not None and deal["discount_pct"] >= BLUESKY_MIN_DISCOUNT_PERCENT
+                    and deal["list_price"]):
+                bluesky_candidates.append(deal)
 
     prune_seen(SEEN_TTL_DAYS)
     print(
@@ -929,6 +940,12 @@ def _process_deals(
         stats["digest_sent"] = _post_webhook(
             DIGEST_WEBHOOK_URL, {"embeds": [build_digest_embed(digest_stats)]}, "digest"
         )
+
+    bluesky_candidates.sort(key=lambda d: d["list_price"] - d["sale_price"], reverse=True)
+    for deal in bluesky_candidates[:BLUESKY_MAX_POSTS_PER_RUN]:
+        if post_to_bluesky(deal):
+            print(f"[bluesky] posted: {deal['title'][:60]}")
+        time.sleep(1)
 
 
 def main():
