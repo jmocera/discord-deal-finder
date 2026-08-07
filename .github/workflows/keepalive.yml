@@ -1,0 +1,27 @@
+name: keepalive
+
+# GitHub automatically disables a workflow's `schedule` trigger if the repo
+# has had no git commit activity for 60 days (workflow *runs* don't count
+# toward that, only actual commits) — a real risk for a repo meant to run
+# unattended for a long time. This pushes an empty commit once a month,
+# comfortably under that threshold, so deal_bot.yml's schedule never lapses
+# and nothing here needs manual attention.
+"on":
+  schedule:
+    - cron: "0 0 1 * *"  # once a month, midnight UTC on the 1st
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "keepalive: prevent scheduled workflow auto-disable"
+          git push
