@@ -1,6 +1,6 @@
 name: deal-bot
 
-on:
+"on":
   schedule:
     # Every 4 hours, on the hour. GitHub doesn't guarantee exact timing on
     # schedule triggers (can lag a few minutes under load), which doesn't
