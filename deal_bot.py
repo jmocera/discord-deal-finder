@@ -282,34 +282,51 @@ def record_price_observations(deals: list[dict]) -> None:
         print(f"[supabase] price_history insert returned {resp.status_code}: {resp.text[:300]}")
 
 
-def get_price_history_stats(deal_id: str) -> tuple[int, float | None]:
-    """Returns (distinct_days_observed, lowest_price_ever_recorded) for a
-    deal ID. Distinct days, not raw row count, on purpose — if this runs
+def get_price_history_stats_bulk(deal_ids: list[str]) -> dict[str, tuple[int, float]]:
+    """Batched replacement for querying price_history one deal at a time
+    inside the posting loop — at 350+ deals a run (more once Best Buy is
+    live), one live request per deal was 350+ sequential round-trips just
+    for history lookups. This fetches everything in a handful of chunked
+    requests instead. Returns {deal_id: (distinct_days_observed,
+    lowest_price_ever_recorded)}; an ID with no history simply isn't a key
+    in the result, so callers should use .get(id, (0, None)).
+
+    Distinct days, not raw row count, on purpose — if this runs
     frequently, several observations can land on the same day without the
     retailer's price ever actually changing, which wouldn't tell us
     anything about real price behavior over time."""
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        return 0, None
-    url = f"{SUPABASE_URL}/rest/v1/price_history"
-    try:
-        resp = requests.get(
-            url, headers=_supabase_headers(),
-            params={"deal_id": f"eq.{deal_id}", "select": "sale_price,observed_at"},
-            timeout=15,
-        )
-    except requests.RequestException as e:
-        print(f"[supabase] price_history stats failed for {deal_id}: {e}")
-        return 0, None
-    if resp.status_code != 200:
-        print(f"[supabase] price_history stats for {deal_id} returned {resp.status_code}: {resp.text[:300]}")
-        return 0, None
+    results: dict[str, tuple[int, float]] = {}
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY or not deal_ids:
+        return results
 
-    rows = resp.json()
-    if not rows:
-        return 0, None
-    distinct_days = len({row["observed_at"][:10] for row in rows})
-    lowest_price = min(row["sale_price"] for row in rows)
-    return distinct_days, lowest_price
+    unique_ids = list(dict.fromkeys(deal_ids))  # de-dupe, keep it simple
+    chunk_size = 100  # keeps each "in.(...)" query string comfortably short
+    url = f"{SUPABASE_URL}/rest/v1/price_history"
+    rows_by_deal: dict[str, list[tuple[str, float]]] = {}
+
+    for i in range(0, len(unique_ids), chunk_size):
+        chunk = unique_ids[i:i + chunk_size]
+        try:
+            resp = requests.get(
+                url, headers=_supabase_headers(),
+                params={"deal_id": f"in.({','.join(chunk)})", "select": "deal_id,sale_price,observed_at"},
+                timeout=20,
+            )
+        except requests.RequestException as e:
+            print(f"[supabase] price_history bulk stats failed: {e}")
+            continue
+        if resp.status_code != 200:
+            print(f"[supabase] price_history bulk stats returned {resp.status_code}: {resp.text[:300]}")
+            continue
+        for row in resp.json():
+            rows_by_deal.setdefault(row["deal_id"], []).append((row["observed_at"][:10], row["sale_price"]))
+
+    for deal_id, rows in rows_by_deal.items():
+        distinct_days = len({day for day, _ in rows})
+        lowest_price = min(price for _, price in rows)
+        results[deal_id] = (distinct_days, lowest_price)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -753,12 +770,18 @@ def post_to_bluesky(deal: dict) -> bool:
 def run_once() -> None:
     seen = load_seen()
     all_deals = []
-    new_count = 0
-    skipped_already_seen = 0
-    skipped_no_better_price = 0
-    skipped_below_threshold = 0
-    skipped_not_near_historical_low = 0
-    digest_sent = False
+    # Mutated in place by _process_deals rather than returned at the end —
+    # if the loop raises partway through (after some deals already
+    # posted), run_once() still has accurate partial counts for log_run()
+    # instead of reporting an all-zero run that actually did something.
+    stats = {
+        "new_count": 0,
+        "skipped_already_seen": 0,
+        "skipped_no_better_price": 0,
+        "skipped_below_threshold": 0,
+        "skipped_not_near_historical_low": 0,
+        "digest_sent": False,
+    }
     # Tallied in-memory for the end-of-run digest — no need to persist
     # "source" into seen_deals since the digest only covers this single
     # run, not a longer window.
@@ -782,55 +805,54 @@ def run_once() -> None:
         # that end up posting — see the PRICE HISTORY section.
         record_price_observations(all_deals)
 
-        (new_count, skipped_already_seen, skipped_no_better_price, skipped_below_threshold,
-         skipped_not_near_historical_low, digest_sent) = _process_deals(all_deals, seen, digest_stats)
+        # One batched lookup for every deal's price history instead of a
+        # live request per deal inside the posting loop.
+        history_map = get_price_history_stats_bulk([d["id"] for d in all_deals])
+
+        _process_deals(all_deals, seen, digest_stats, stats, history_map)
     except Exception as e:
         log_run(
-            deals_checked=len(all_deals), posted=new_count,
-            skipped_already_seen=skipped_already_seen,
-            skipped_no_better_price=skipped_no_better_price,
-            skipped_below_threshold=skipped_below_threshold,
-            skipped_not_near_historical_low=skipped_not_near_historical_low,
-            digest_sent=digest_sent, error=str(e),
+            deals_checked=len(all_deals), posted=stats["new_count"],
+            skipped_already_seen=stats["skipped_already_seen"],
+            skipped_no_better_price=stats["skipped_no_better_price"],
+            skipped_below_threshold=stats["skipped_below_threshold"],
+            skipped_not_near_historical_low=stats["skipped_not_near_historical_low"],
+            digest_sent=stats["digest_sent"], error=str(e),
         )
         raise
     else:
         log_run(
-            deals_checked=len(all_deals), posted=new_count,
-            skipped_already_seen=skipped_already_seen,
-            skipped_no_better_price=skipped_no_better_price,
-            skipped_below_threshold=skipped_below_threshold,
-            skipped_not_near_historical_low=skipped_not_near_historical_low,
-            digest_sent=digest_sent, error=None,
+            deals_checked=len(all_deals), posted=stats["new_count"],
+            skipped_already_seen=stats["skipped_already_seen"],
+            skipped_no_better_price=stats["skipped_no_better_price"],
+            skipped_below_threshold=stats["skipped_below_threshold"],
+            skipped_not_near_historical_low=stats["skipped_not_near_historical_low"],
+            digest_sent=stats["digest_sent"], error=None,
         )
 
 
-def _process_deals(all_deals: list[dict], seen: dict, digest_stats: dict) -> tuple[int, int, int, int, int, bool]:
+def _process_deals(
+    all_deals: list[dict], seen: dict, digest_stats: dict, stats: dict, history_map: dict
+) -> None:
     """The main posting loop, split out so run_once() can wrap it in a
     single try/except for log_run without one giant indented block.
-    Returns (new_count, skipped_already_seen, skipped_no_better_price,
-    skipped_below_threshold, skipped_not_near_historical_low, digest_sent)."""
-    new_count = 0
-    skipped_already_seen = 0
-    skipped_no_better_price = 0
-    skipped_below_threshold = 0
-    skipped_not_near_historical_low = 0
-
+    Mutates `stats` (new_count, skipped_*, digest_sent) in place rather
+    than returning at the end — see the comment in run_once()."""
     for deal in all_deals:
         prior = seen.get(deal["id"])
         if prior:
             prior_price = prior.get("sale_price")
             if prior_price is None:
-                skipped_already_seen += 1
+                stats["skipped_already_seen"] += 1
                 continue
             if deal["sale_price"] >= prior_price - MIN_DOLLAR_SAVINGS:
-                skipped_no_better_price += 1
+                stats["skipped_no_better_price"] += 1
                 continue
         if deal["discount_pct"] is None or deal["discount_pct"] < MIN_DISCOUNT_PERCENT:
-            skipped_below_threshold += 1
+            stats["skipped_below_threshold"] += 1
             continue
         if deal["list_price"] and (deal["list_price"] - deal["sale_price"]) < MIN_DOLLAR_SAVINGS:
-            skipped_below_threshold += 1
+            stats["skipped_below_threshold"] += 1
             continue
 
         # Price-history quality gate. Discount off the retailer's listed
@@ -839,12 +861,13 @@ def _process_deals(all_deals: list[dict], seen: dict, digest_stats: dict) -> tup
         # the sale price to actually be near its own recorded floor, not
         # just far from a number the retailer picked. Dormant until
         # PRICE_HISTORY_MIN_DAYS of distinct-day history exists for a
-        # given deal_id — see get_price_history_stats().
-        history_days, history_low = get_price_history_stats(deal["id"])
+        # given deal_id. Looked up from the batch fetched in run_once(),
+        # not queried live — see get_price_history_stats_bulk().
+        history_days, history_low = history_map.get(deal["id"], (0, None))
         if history_days >= PRICE_HISTORY_MIN_DAYS and history_low is not None:
             ceiling = history_low * (1 + PRICE_HISTORY_TOLERANCE_PERCENT / 100)
             if deal["sale_price"] > ceiling:
-                skipped_not_near_historical_low += 1
+                stats["skipped_not_near_historical_low"] += 1
                 continue
 
         # Price-history tracking for the embed badge. We only know about
@@ -870,7 +893,7 @@ def _process_deals(all_deals: list[dict], seen: dict, digest_stats: dict) -> tup
                 "lowest_price_date": deal["lowest_price_date"],
             }
             upsert_seen_entry(deal["id"], deal["source"], seen[deal["id"]])  # write immediately so a Ctrl+C or later failure doesn't lose this
-            new_count += 1
+            stats["new_count"] += 1
             time.sleep(2)  # be gentle with the Discord webhook rate limit
 
             source_stats = digest_stats.setdefault(deal["source"], {"count": 0, "total_savings": 0.0, "best": None})
@@ -893,21 +916,19 @@ def _process_deals(all_deals: list[dict], seen: dict, digest_stats: dict) -> tup
     prune_seen(SEEN_TTL_DAYS)
     print(
         f"[run] checked {len(all_deals)} deals — "
-        f"{new_count} posted, "
-        f"{skipped_already_seen} already posted at this price or better, "
-        f"{skipped_no_better_price} same item but not enough of a price drop, "
-        f"{skipped_below_threshold} below the discount/savings threshold, "
-        f"{skipped_not_near_historical_low} not near their historical low"
+        f"{stats['new_count']} posted, "
+        f"{stats['skipped_already_seen']} already posted at this price or better, "
+        f"{stats['skipped_no_better_price']} same item but not enough of a price drop, "
+        f"{stats['skipped_below_threshold']} below the discount/savings threshold, "
+        f"{stats['skipped_not_near_historical_low']} not near their historical low"
     )
 
     # Only send a digest when there's something to report — an empty
     # "0 posted" message every run would just be noise.
-    digest_sent = False
-    if new_count > 0 and DIGEST_WEBHOOK_URL:
-        digest_sent = _post_webhook(DIGEST_WEBHOOK_URL, {"embeds": [build_digest_embed(digest_stats)]}, "digest")
-
-    return (new_count, skipped_already_seen, skipped_no_better_price, skipped_below_threshold,
-            skipped_not_near_historical_low, digest_sent)
+    if stats["new_count"] > 0 and DIGEST_WEBHOOK_URL:
+        stats["digest_sent"] = _post_webhook(
+            DIGEST_WEBHOOK_URL, {"embeds": [build_digest_embed(digest_stats)]}, "digest"
+        )
 
 
 def main():
