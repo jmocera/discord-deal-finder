@@ -35,8 +35,12 @@ jobs:
           RUN_LOG_WEBHOOK_URL: ${{ secrets.RUN_LOG_WEBHOOK_URL }}
           BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
           BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
-          MIN_DISCOUNT_PERCENT: ${{ secrets.MIN_DISCOUNT_PERCENT }}
-          MIN_DOLLAR_SAVINGS: ${{ secrets.MIN_DOLLAR_SAVINGS }}
-          BLUESKY_MIN_DISCOUNT_PERCENT: ${{ secrets.BLUESKY_MIN_DISCOUNT_PERCENT }}
-          PRICE_HISTORY_MIN_DAYS: ${{ secrets.PRICE_HISTORY_MIN_DAYS }}
-          PRICE_HISTORY_TOLERANCE_PERCENT: ${{ secrets.PRICE_HISTORY_TOLERANCE_PERCENT }}
+          # Plain tuning numbers, not credentials — repo Variables (not
+          # Secrets) so they stay visible/editable via Settings -> Secrets
+          # and variables -> Actions -> Variables instead of being
+          # write-only.
+          MIN_DISCOUNT_PERCENT: ${{ vars.MIN_DISCOUNT_PERCENT }}
+          MIN_DOLLAR_SAVINGS: ${{ vars.MIN_DOLLAR_SAVINGS }}
+          BLUESKY_MIN_DISCOUNT_PERCENT: ${{ vars.BLUESKY_MIN_DISCOUNT_PERCENT }}
+          PRICE_HISTORY_MIN_DAYS: ${{ vars.PRICE_HISTORY_MIN_DAYS }}
+          PRICE_HISTORY_TOLERANCE_PERCENT: ${{ vars.PRICE_HISTORY_TOLERANCE_PERCENT }}
