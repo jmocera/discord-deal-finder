@@ -2,11 +2,10 @@ name: deal-bot
 
 on:
   schedule:
-    # Every 30 minutes, matching the old --interval 1800 default. GitHub
-    # doesn't guarantee exact timing on schedule triggers (can lag a few
-    # minutes under load), which doesn't matter for this use case. Adjust
-    # the cadence here if you want it more/less frequent.
-    - cron: "*/30 * * * *"
+    # Every 4 hours, on the hour. GitHub doesn't guarantee exact timing on
+    # schedule triggers (can lag a few minutes under load), which doesn't
+    # matter for this use case. Adjust the cadence here if needed.
+    - cron: "0 */4 * * *"
   workflow_dispatch: {}  # lets you trigger a run manually from the Actions tab
 
 jobs:
