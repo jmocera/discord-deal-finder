@@ -742,13 +742,36 @@ def post_to_bluesky(deal: dict) -> bool:
 
     text = build_x_caption(deal)  # plain text, no markdown — works for Bluesky too
     if len(text) > 300:  # Bluesky's post length limit
-        text = text[:296] + "…"
+        # Trim the caption body, not a blind tail-slice of the whole
+        # string — the URL sits on the last line, and slicing the whole
+        # thing could clip or remove it, silently breaking the link
+        # facet below for anything long enough to need truncating.
+        url_suffix = f"\n{deal['url']}"
+        body = text[:-len(url_suffix)] if text.endswith(url_suffix) else text
+        max_body_len = 300 - len(url_suffix) - 1  # -1 for the trailing "…"
+        text = body[:max_body_len] + "…" + url_suffix
 
     record = {
         "$type": "app.bsky.feed.post",
         "text": text,
         "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
+
+    # AT Protocol doesn't auto-linkify plain URLs in post text the way
+    # most social apps do — without an explicit "facet" marking the byte
+    # range and its target, a URL renders as inert plain text (exactly
+    # what was happening). Byte offsets, not character offsets: facets
+    # are defined over the UTF-8-encoded text, and this caption can
+    # contain multi-byte characters (e.g. the em dash) before the URL.
+    url_bytes = deal["url"].encode("utf-8")
+    text_bytes = text.encode("utf-8")
+    idx = text_bytes.find(url_bytes)
+    if idx != -1:
+        record["facets"] = [{
+            "index": {"byteStart": idx, "byteEnd": idx + len(url_bytes)},
+            "features": [{"$type": "app.bsky.richtext.facet#link", "uri": deal["url"]}],
+        }]
+
     try:
         resp = requests.post(
             "https://bsky.social/xrpc/com.atproto.repo.createRecord",
