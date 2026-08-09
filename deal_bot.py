@@ -106,6 +106,22 @@ BLUESKY_APP_PASSWORD = os.environ.get("BLUESKY_APP_PASSWORD", "")
 BLUESKY_MIN_DISCOUNT_PERCENT = int(os.environ.get("BLUESKY_MIN_DISCOUNT_PERCENT", "50"))
 BLUESKY_MAX_POSTS_PER_RUN = int(os.environ.get("BLUESKY_MAX_POSTS_PER_RUN", "2"))
 
+# OpenRouter — AI-written captions for Bluesky and the private-channel
+# copy-paste mirror, replacing the plain template. Tries the primary
+# model, then the free fallback model, then the plain template as a last
+# resort — this must never be able to block a post from going out.
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_PRIMARY_MODEL = os.environ.get("OPENROUTER_PRIMARY_MODEL", "deepseek/deepseek-v4-flash-0731")
+OPENROUTER_FALLBACK_MODEL = os.environ.get("OPENROUTER_FALLBACK_MODEL", "openai/gpt-oss-20b:free")
+OPENROUTER_CAPTION_SYSTEM_PROMPT = """You write short, engaging social media captions for a deal-finding bot that posts real-time discounts on PC hardware, electronics, and PC games.
+
+Output ONLY the caption text — no preamble, no explanation, no quotation marks, no markdown formatting, no code fences.
+
+Keep the entire output under 200 characters. Mention the discount and price naturally, not as a bare stat dump. End with 2 to 4 relevant, space-separated hashtags chosen specifically for the item — vary them based on what the deal actually is. Never include a URL or link.
+
+Example:
+🔥 55% off this ASUS 27" gaming monitor — now $189.99, was $429.99. Big drop for a 165Hz panel. #PCBuild #GamingDeals #TechDeals"""
+
 # Woot feeds that map to your electronics/gaming focus.
 # Valid options: All, Clearance, Computers, Electronics, Featured, Home,
 # Gourmet, Shirts, Sports, Tools, Wootoff
@@ -677,6 +693,88 @@ def build_x_caption(deal: dict) -> str:
     return f"{discount} — {deal['title']} — {price}\n{deal['url']}"
 
 
+def _call_openrouter(model: str, user_prompt: str) -> str | None:
+    if not OPENROUTER_API_KEY:
+        return None
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": OPENROUTER_CAPTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                # Both models here are reasoning models: part of the token
+                # budget goes to an internal reasoning trace before the
+                # actual answer. Without capping effort, this task (a short
+                # caption) doesn't need much reasoning, but a model can
+                # still burn the entire budget on it and leave content
+                # null — reliably reproduced in testing with the free
+                # fallback model at 0/5 successful calls before this was
+                # added. "low" effort plus a generous max_tokens (still
+                # fractions of a cent either way) fixed that.
+                "max_tokens": 350,
+                "reasoning": {"effort": "low"},
+                "temperature": 0.8,
+            },
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        print(f"[openrouter] request failed for model {model}: {e}")
+        return None
+    if resp.status_code != 200:
+        print(f"[openrouter] model {model} returned {resp.status_code}: {resp.text[:300]}")
+        return None
+    try:
+        content = resp.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, ValueError, TypeError) as e:
+        print(f"[openrouter] unexpected response shape from {model}: {e}")
+        return None
+    if not content:
+        # Present-but-null/empty content — e.g. a reasoning model that
+        # burned its whole budget on the reasoning trace and never got to
+        # write an answer. Not an exception, just "no usable output."
+        print(f"[openrouter] {model} returned no usable content (reasoning may have exhausted the token budget)")
+        return None
+    # Small/free models occasionally ignore "no quotation marks" — strip a
+    # single wrapping pair if present rather than rejecting the whole thing.
+    content = content.strip().strip('"').strip("'").strip()
+    return content or None
+
+
+def build_ai_caption(deal: dict) -> str:
+    """Tries OPENROUTER_PRIMARY_MODEL, then OPENROUTER_FALLBACK_MODEL, then
+    the plain build_x_caption() template if both fail or OPENROUTER_API_KEY
+    isn't set — this must never be able to block a post from going out.
+    The URL is deliberately not part of the prompt; it's appended here in
+    code so the LLM can't alter it and break the Bluesky link facet."""
+    discount = f"{deal['discount_pct']}% off" if deal["discount_pct"] else "On sale"
+    price = f"${deal['sale_price']:.2f}"
+    if deal["list_price"]:
+        price += f" (was ${deal['list_price']:.2f})"
+    user_prompt = (
+        f"Deal source: {deal['source']}\n"
+        f"Item: {deal['title']}\n"
+        f"Discount: {discount}\n"
+        f"Price: {price}\n\n"
+        "Write the caption."
+    )
+
+    for model in (OPENROUTER_PRIMARY_MODEL, OPENROUTER_FALLBACK_MODEL):
+        caption = _call_openrouter(model, user_prompt)
+        if caption and len(caption) <= 260:  # sanity ceiling before trusting it
+            return f"{caption}\n{deal['url']}"
+        if caption:
+            print(f"[openrouter] {model} response too long ({len(caption)} chars), trying next")
+
+    return build_x_caption(deal)  # last resort: mechanical template
+
+
 SOURCE_WEBHOOKS = {
     "Woot": WOOT_WEBHOOK_URL,
     "Best Buy": BESTBUY_WEBHOOK_URL,
@@ -700,7 +798,7 @@ def post_to_discord(deal: dict) -> bool:
         _post_webhook(PRIVATE_WEBHOOK_URL, {"embeds": [embed]}, "private")
 
         time.sleep(0.5)
-        caption = build_x_caption(deal)
+        caption = build_ai_caption(deal)
         # X's real limit is 280 chars — flagged, not auto-trimmed, since
         # you're copying this by hand and can judge how best to cut it.
         warning = f"⚠️ {len(caption)} chars — over X's 280 limit, trim before posting\n" if len(caption) > 280 else ""
@@ -742,7 +840,7 @@ def post_to_bluesky(deal: dict) -> bool:
     if not session:
         return False
 
-    text = build_x_caption(deal)  # plain text, no markdown — works for Bluesky too
+    text = build_ai_caption(deal)  # AI-written when available, template on fallback
     if len(text) > 300:  # Bluesky's post length limit
         # Trim the caption body, not a blind tail-slice of the whole
         # string — the URL sits on the last line, and slicing the whole
