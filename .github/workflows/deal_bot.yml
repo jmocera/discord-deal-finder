@@ -35,6 +35,9 @@ jobs:
           RUN_LOG_WEBHOOK_URL: ${{ secrets.RUN_LOG_WEBHOOK_URL }}
           BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
           BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_PRIMARY_MODEL: ${{ vars.OPENROUTER_PRIMARY_MODEL }}
+          OPENROUTER_FALLBACK_MODEL: ${{ vars.OPENROUTER_FALLBACK_MODEL }}
           # Plain tuning numbers, not credentials — repo Variables (not
           # Secrets) so they stay visible/editable via Settings -> Secrets
           # and variables -> Actions -> Variables instead of being
