@@ -33,6 +33,7 @@ jobs:
           PRIVATE_WEBHOOK_URL: ${{ secrets.PRIVATE_WEBHOOK_URL }}
           DIGEST_WEBHOOK_URL: ${{ secrets.DIGEST_WEBHOOK_URL }}
           RUN_LOG_WEBHOOK_URL: ${{ secrets.RUN_LOG_WEBHOOK_URL }}
+          SHADOW_CLASSIFIER_WEBHOOK_URL: ${{ secrets.SHADOW_CLASSIFIER_WEBHOOK_URL }}
           BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
           BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
