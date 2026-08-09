@@ -122,6 +122,15 @@ Keep the entire output under 200 characters. Mention the discount and price natu
 Example:
 🔥 55% off this ASUS 27" gaming monitor — now $189.99, was $429.99. Big drop for a 165Hz panel. #PCBuild #GamingDeals #TechDeals"""
 
+# SHADOW MODE: reports what the desirability classifier (see
+# classify_desirable_deals) would have kept/dropped, without actually
+# gating real posts on it yet — a dedicated channel to review its
+# judgment against real deals before ever trusting it as a real filter.
+SHADOW_CLASSIFIER_WEBHOOK_URL = os.environ.get("SHADOW_CLASSIFIER_WEBHOOK_URL", "")
+OPENROUTER_CLASSIFIER_SYSTEM_PROMPT = """You screen deal listings for a bot that posts discounts to an audience of PC-building and PC-gaming enthusiasts. For each numbered item below, decide whether it is something that audience would genuinely want — not just topically related (e.g. "electronics"), but actually desirable: recognizable brands, real PC parts, monitors, peripherals, games, and similar. Reject generic, off-brand, or low-interest items even if they're topically in-category.
+
+Respond with exactly one line per item, in the same order as the input, containing only the word KEEP or DROP — nothing else. No numbering, no explanation, no extra text. The number of output lines must exactly match the number of input items."""
+
 # Woot feeds that map to your electronics/gaming focus.
 # Valid options: All, Clearance, Computers, Electronics, Featured, Home,
 # Gourmet, Shirts, Sports, Tools, Wootoff
@@ -656,6 +665,28 @@ def build_run_log_embed(
     }
 
 
+def build_shadow_classification_embed(keep: list[dict], drop: list[dict], model_used: str) -> dict:
+    """SHADOW MODE report — shows what classify_desirable_deals() would
+    have dropped from this run's actual posts, for review. Nothing was
+    actually withheld; every deal in `keep` and `drop` combined posted
+    normally this run."""
+    fields = [
+        {"name": "Kept", "value": str(len(keep)), "inline": True},
+        {"name": "Would drop", "value": str(len(drop)), "inline": True},
+        {"name": "Model", "value": model_used, "inline": True},
+    ]
+    if drop:
+        lines = [f"[{d['title'][:70]}]({d['url']}) — {d['source']}" for d in drop[:10]]
+        fields.append({"name": "Would have dropped", "value": "\n".join(lines), "inline": False})
+
+    return {
+        "title": "🔍 Desirability Classifier (Shadow Mode — nothing was actually withheld)",
+        "color": 0x95A5A6,
+        "fields": fields,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _post_webhook(webhook_url: str, payload: dict, label: str) -> bool:
     max_retries = 5
     for attempt in range(1, max_retries + 1):
@@ -693,7 +724,10 @@ def build_x_caption(deal: dict) -> str:
     return f"{discount} — {deal['title']} — {price}\n{deal['url']}"
 
 
-def _call_openrouter(model: str, user_prompt: str) -> str | None:
+def _call_openrouter(
+    model: str, system_prompt: str, user_prompt: str,
+    *, temperature: float = 0.8, max_tokens: int = 350,
+) -> str | None:
     if not OPENROUTER_API_KEY:
         return None
     try:
@@ -706,21 +740,20 @@ def _call_openrouter(model: str, user_prompt: str) -> str | None:
             json={
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": OPENROUTER_CAPTION_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 # Both models here are reasoning models: part of the token
                 # budget goes to an internal reasoning trace before the
-                # actual answer. Without capping effort, this task (a short
-                # caption) doesn't need much reasoning, but a model can
-                # still burn the entire budget on it and leave content
-                # null — reliably reproduced in testing with the free
-                # fallback model at 0/5 successful calls before this was
-                # added. "low" effort plus a generous max_tokens (still
-                # fractions of a cent either way) fixed that.
-                "max_tokens": 350,
+                # actual answer. Without capping effort, a model can burn
+                # the entire budget on it and leave content null —
+                # reliably reproduced in testing with the free fallback
+                # model at 0/5 successful calls before this was added.
+                # "low" effort plus generous max_tokens (still fractions
+                # of a cent either way) fixed that.
+                "max_tokens": max_tokens,
                 "reasoning": {"effort": "low"},
-                "temperature": 0.8,
+                "temperature": temperature,
             },
             timeout=20,
         )
@@ -766,13 +799,64 @@ def build_ai_caption(deal: dict) -> str:
     )
 
     for model in (OPENROUTER_PRIMARY_MODEL, OPENROUTER_FALLBACK_MODEL):
-        caption = _call_openrouter(model, user_prompt)
+        caption = _call_openrouter(model, OPENROUTER_CAPTION_SYSTEM_PROMPT, user_prompt, temperature=0.8)
         if caption and len(caption) <= 260:  # sanity ceiling before trusting it
             return f"{caption}\n{deal['url']}"
         if caption:
             print(f"[openrouter] {model} response too long ({len(caption)} chars), trying next")
 
     return build_x_caption(deal)  # last resort: mechanical template
+
+
+def classify_desirable_deals(deals: list[dict]) -> tuple[list[dict], list[dict], str | None]:
+    """SHADOW MODE (not gating anything yet). One batched OpenRouter call
+    judging whether each deal is genuinely desirable to a PC-building/
+    gaming audience, beyond just having cleared the keyword/discount
+    filters. Returns (keep, drop, model_used).
+
+    Fails OPEN: if both models error or the response doesn't parse
+    cleanly (wrong line count, anything other than KEEP/DROP), everything
+    is kept. A wrong KEEP is a mediocre post; a wrong DROP would be an
+    invisible lost deal — once/if this becomes a real gate, keeping
+    everything is the safer failure direction. In shadow mode a failed
+    call just means no report gets sent this run."""
+    if not deals:
+        return [], [], None
+    if not OPENROUTER_API_KEY:
+        return list(deals), [], None
+
+    lines = [
+        f"{i}. [{d['source']}] {d['title']} — {d['discount_pct']}% off, ${d['sale_price']:.2f}"
+        for i, d in enumerate(deals, start=1)
+    ]
+    user_prompt = "\n".join(lines)
+    # A generous floor, not just a per-item scale-up: reasoning overhead
+    # doesn't shrink proportionally with a smaller item count, and a
+    # too-tight budget reproduces the same null-content failure the
+    # caption path hit before its fix — confirmed in testing (108 tokens
+    # for a 6-item batch failed on both models).
+    max_tokens = min(1500, 300 + len(deals) * 15)
+
+    for model in (OPENROUTER_PRIMARY_MODEL, OPENROUTER_FALLBACK_MODEL):
+        response = _call_openrouter(
+            model, OPENROUTER_CLASSIFIER_SYSTEM_PROMPT, user_prompt,
+            temperature=0.1, max_tokens=max_tokens,
+        )
+        if not response:
+            continue
+        verdicts = [line.strip().upper() for line in response.strip().splitlines() if line.strip()]
+        if len(verdicts) != len(deals) or any(v not in ("KEEP", "DROP") for v in verdicts):
+            print(
+                f"[openrouter] classifier response from {model} didn't parse cleanly "
+                f"({len(verdicts)} lines for {len(deals)} deals) — trying next"
+            )
+            continue
+        keep = [d for d, v in zip(deals, verdicts) if v == "KEEP"]
+        drop = [d for d, v in zip(deals, verdicts) if v == "DROP"]
+        return keep, drop, model
+
+    print("[openrouter] classifier unavailable from both models this run — no shadow report")
+    return list(deals), [], None
 
 
 SOURCE_WEBHOOKS = {
@@ -973,6 +1057,7 @@ def _process_deals(
     Mutates `stats` (new_count, skipped_*, digest_sent) in place rather
     than returning at the end — see the comment in run_once()."""
     bluesky_candidates = []  # collected here, ranked and capped after the loop
+    posted_deals = []  # every deal that actually posted this run — for the shadow classifier report
 
     for deal in all_deals:
         prior = seen.get(deal["id"])
@@ -1030,6 +1115,7 @@ def _process_deals(
             }
             upsert_seen_entry(deal["id"], deal["source"], seen[deal["id"]])  # write immediately so a Ctrl+C or later failure doesn't lose this
             stats["new_count"] += 1
+            posted_deals.append(deal)
             time.sleep(2)  # be gentle with the Discord webhook rate limit
 
             source_stats = digest_stats.setdefault(deal["source"], {"count": 0, "total_savings": 0.0, "best": None})
@@ -1078,6 +1164,19 @@ def _process_deals(
         if post_to_bluesky(deal):
             print(f"[bluesky] posted: {deal['title'][:60]}")
         time.sleep(1)
+
+    # SHADOW MODE: report what the desirability classifier would have
+    # kept/dropped from this run's actual posts. Nothing here changes
+    # what already posted above — this is purely for reviewing the
+    # classifier's judgment before ever trusting it as a real gate.
+    if posted_deals and SHADOW_CLASSIFIER_WEBHOOK_URL:
+        keep, drop, model_used = classify_desirable_deals(posted_deals)
+        if model_used:
+            _post_webhook(
+                SHADOW_CLASSIFIER_WEBHOOK_URL,
+                {"embeds": [build_shadow_classification_embed(keep, drop, model_used)]},
+                "shadow-classifier",
+            )
 
 
 def main():
