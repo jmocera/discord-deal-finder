@@ -59,7 +59,7 @@ import os
 import time
 import argparse
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote
 
 import requests
@@ -265,23 +265,25 @@ def prune_seen(ttl_days: int) -> None:
 def record_price_observations(deals: list[dict]) -> None:
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY or not deals:
         return
-    url = f"{SUPABASE_URL}/rest/v1/price_history"
+    url = f"{SUPABASE_URL}/rest/v1/price_history?on_conflict=deal_id,observed_date"
+    today = date.today().isoformat()
     rows = [{
         "deal_id": d["id"],
         "source": d["source"],
         "sale_price": d["sale_price"],
         "list_price": d["list_price"],
         "discount_pct": d["discount_pct"],
+        "observed_date": today,
     } for d in deals]
     headers = _supabase_headers()
-    headers["Prefer"] = "return=minimal"
+    headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
     try:
         resp = requests.post(url, headers=headers, json=rows, timeout=30)
     except requests.RequestException as e:
-        print(f"[supabase] price_history insert failed: {e}")
+        print(f"[supabase] price_history upsert failed: {e}")
         return
     if resp.status_code not in (200, 201, 204):
-        print(f"[supabase] price_history insert returned {resp.status_code}: {resp.text[:300]}")
+        print(f"[supabase] price_history upsert returned {resp.status_code}: {resp.text[:300]}")
 
 
 def get_price_history_stats_bulk(deal_ids: list[str]) -> dict[str, tuple[int, float]]:
@@ -825,6 +827,15 @@ def run_once() -> None:
             time.sleep(0.3)
 
         all_deals.extend(fetch_steam_specials())  # single request, no loop needed
+
+        # Woot's "Electronics" and "Computers" feeds can both list the
+        # same item, and Best Buy's search terms can overlap the same way
+        # (e.g. "gaming mouse" and "mouse" returning the same SKU) — so
+        # all_deals can contain the same deal_id more than once before
+        # this point. Dedup once, here, so every downstream step (price
+        # history, the historical-low gate, and the posting loop) sees
+        # each deal exactly once per run instead of double-counting it.
+        all_deals = list({d["id"]: d for d in all_deals}.values())
 
         # Log a price observation for every fetched deal, not just ones
         # that end up posting — see the PRICE HISTORY section.
