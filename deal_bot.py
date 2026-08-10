@@ -56,6 +56,7 @@ NOTES
 """
 
 import os
+import re
 import time
 import argparse
 from pathlib import Path
@@ -919,6 +920,88 @@ def _bluesky_login() -> dict | None:
     return _bluesky_session
 
 
+_HASHTAG_PATTERN = re.compile(r"#(\w+)")
+
+
+def _build_tag_facets(text: str) -> list[dict]:
+    """One app.bsky.richtext.facet#tag per #hashtag in text. Byte offsets
+    (not character offsets) computed the same way as the URL link facet
+    below — encode the prefix up to each match to correctly account for
+    any multi-byte characters (em dashes, accents) earlier in the text."""
+    facets = []
+    for match in _HASHTAG_PATTERN.finditer(text):
+        tag_name = match.group(1)
+        byte_start = len(text[:match.start()].encode("utf-8"))
+        byte_end = len(text[:match.end()].encode("utf-8"))
+        facets.append({
+            "index": {"byteStart": byte_start, "byteEnd": byte_end},
+            "features": [{"$type": "app.bsky.richtext.facet#tag", "tag": tag_name}],
+        })
+    return facets
+
+
+def _build_bluesky_embed(session: dict, deal: dict) -> dict | None:
+    """Downloads the deal's image and uploads it as a blob for a rich
+    external-link preview card. Fails open at every step — no image URL,
+    a download error, a non-image response, or an uploadBlob failure all
+    just mean no card; post_to_bluesky() still sends the post as plain
+    text+facets either way."""
+    image_url = deal.get("image")
+    if not image_url:
+        return None
+
+    try:
+        img_resp = requests.get(image_url, timeout=10)
+        img_resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[bluesky] thumbnail download failed: {e}")
+        return None
+
+    content_type = img_resp.headers.get("Content-Type", "").split(";")[0].strip()
+    if not content_type.startswith("image/"):
+        print(f"[bluesky] thumbnail skipped — unexpected content-type {content_type!r}")
+        return None
+
+    try:
+        blob_resp = requests.post(
+            "https://bsky.social/xrpc/com.atproto.repo.uploadBlob",
+            headers={
+                "Authorization": f"Bearer {session['accessJwt']}",
+                "Content-Type": content_type,
+            },
+            data=img_resp.content,
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        print(f"[bluesky] thumbnail upload failed: {e}")
+        return None
+    # Covers oversized images too — the PDS rejects those with a non-200
+    # rather than us needing to guess its exact size cap up front.
+    if blob_resp.status_code != 200:
+        print(f"[bluesky] thumbnail upload returned {blob_resp.status_code}: {blob_resp.text[:300]}")
+        return None
+
+    try:
+        blob = blob_resp.json()["blob"]
+    except (KeyError, ValueError, TypeError) as e:
+        print(f"[bluesky] unexpected uploadBlob response shape: {e}")
+        return None
+
+    description = f"${deal['sale_price']:.2f}"
+    if deal["list_price"]:
+        description = f"Now ${deal['sale_price']:.2f} (was ${deal['list_price']:.2f})"
+
+    return {
+        "$type": "app.bsky.embed.external",
+        "external": {
+            "uri": deal["url"],
+            "title": deal["title"][:300],
+            "description": description,
+            "thumb": blob,
+        },
+    }
+
+
 def post_to_bluesky(deal: dict) -> bool:
     session = _bluesky_login()
     if not session:
@@ -947,14 +1030,23 @@ def post_to_bluesky(deal: dict) -> bool:
     # what was happening). Byte offsets, not character offsets: facets
     # are defined over the UTF-8-encoded text, and this caption can
     # contain multi-byte characters (e.g. the em dash) before the URL.
+    facets = []
     url_bytes = deal["url"].encode("utf-8")
     text_bytes = text.encode("utf-8")
     idx = text_bytes.find(url_bytes)
     if idx != -1:
-        record["facets"] = [{
+        facets.append({
             "index": {"byteStart": idx, "byteEnd": idx + len(url_bytes)},
             "features": [{"$type": "app.bsky.richtext.facet#link", "uri": deal["url"]}],
-        }]
+        })
+    facets.extend(_build_tag_facets(text))
+    if facets:
+        facets.sort(key=lambda f: f["index"]["byteStart"])
+        record["facets"] = facets
+
+    embed = _build_bluesky_embed(session, deal)
+    if embed:
+        record["embed"] = embed
 
     try:
         resp = requests.post(
