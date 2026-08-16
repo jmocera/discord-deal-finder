@@ -1,6 +1,11 @@
 # deal-bot — Project Handoff
 
-Last updated: 2026-08-09 (during initial build-out session)
+Last updated: 2026-08-16 — added spec extraction, the caption "verdict"
+upgrade, and CI test wiring since the previous update.
+
+See also `VoltDrop_Project_Scope.md` in this repo for a narrative,
+higher-level overview of the same project — this document stays the deep
+technical/operational reference (exact schemas, commands, full bug list).
 
 ## What this is
 
@@ -97,6 +102,20 @@ setting change, not a code change.
   so URLs render as clickable links — this was broken (posted as inert
   plain text) and fixed; two already-live broken posts were deleted and
   reposted with working links.
+- Posts also carry a **rich link-preview card**: the deal's image is
+  downloaded and uploaded as a blob via raw `com.atproto.repo.uploadBlob`,
+  then attached as an `app.bsky.embed.external` card (title, description,
+  thumbnail). Fails open at every step (no image, download error,
+  non-image content-type, upload rejection all just mean no card, not a
+  blocked post). See `_build_bluesky_embed()`.
+- Every `#hashtag` in the caption gets its own clickable
+  `app.bsky.richtext.facet#tag`, computed with the same UTF-8 byte-offset
+  method as the link facet (`_build_tag_facets()`), verified to coexist
+  correctly with the link facet (no overlaps, correct ordering) even with
+  emoji/accented characters in the text.
+- Both of the above are raw REST/XRPC calls, same as everything else in
+  this file — the official `atproto` SDK was considered and explicitly
+  declined to avoid adding a dependency used nowhere else in the project.
 
 ## OpenRouter / AI features
 
@@ -110,20 +129,53 @@ free-tier fallback).
 - `OPENROUTER_API_KEY` — secret.
 - `OPENROUTER_PRIMARY_MODEL` — variable, currently `deepseek/deepseek-v4-flash-0731` (paid, very cheap: $0.09/M prompt, $0.18/M completion tokens).
 - `OPENROUTER_FALLBACK_MODEL` — variable, currently `openai/gpt-oss-20b:free`.
-- **Both are reasoning models** — this mattered a lot in practice (see
-  "Bugs fixed"). Calls use `reasoning: {"effort": "low"}` plus a generous
-  `max_tokens` floor; too tight a budget lets reasoning consume the whole
-  thing and return null content instead of an answer.
+- `OPENROUTER_SPEC_EXTRACTION_MODEL` — variable, currently `google/gemini-2.5-flash-lite`. Used only by spec extraction (below) — a separate model from the caption/classifier pair above.
+- **Reasoning-effort handling is model-specific, not a fixed rule** — this
+  mattered in practice three separate times (see "Bugs fixed"). The
+  caption/classifier models need `reasoning: {"effort": "low"}` explicitly
+  set, or they can burn their whole token budget on internal reasoning and
+  return null content. The spec-extraction model needs the *opposite* —
+  setting any reasoning effort breaks it; omitting the parameter is what
+  makes it reliable. `_call_openrouter()` takes `reasoning` as an explicit
+  opt-in per call for exactly this reason — don't assume one config works
+  for a model without testing it.
 
-**Feature 1 — AI-written captions (LIVE, actually affects what posts):**
-`build_ai_caption()` replaces the old mechanical caption template for both
-the Bluesky auto-post and the private-channel mirror. Three-tier fallback:
-primary model → free fallback model → plain template (`build_x_caption()`)
-— must never be able to block a post. The exact prompt (system + how the
-per-deal user prompt is built) is in `deal_bot.py` around
+**Captions — upgraded from marketing copy to data-backed "verdicts"
+(2026-08-16):** `build_ai_caption()` originally wrote generic engaging
+captions; it now writes 1-2 sentence analytical verdicts explaining *why*
+a deal is specifically noteworthy, grounded in real signals fed into the
+prompt: the item's `clean_title`/`specs` (from spec extraction, below) and
+real Supabase price-history context (`is_new_low` / `lowest_price`).
+Anti-hallucination instruction forbids stating any spec not explicitly
+given. Still a three-tier fallback: primary model → free fallback model →
+plain template (`build_x_caption()`) — must never be able to block a
+post. The exact prompt is in `deal_bot.py` around
 `OPENROUTER_CAPTION_SYSTEM_PROMPT` / `build_ai_caption()`.
 
-**Feature 2 — Desirability classifier (SHADOW MODE ONLY, not gating
+**Hashtags are deliberately *not* restricted to a fixed allow-list.** A
+stricter spec proposed a hard 2-tag allow-list (`#gaming`/`#pcgaming`
+only); this was explicitly reviewed and rejected in favor of keeping the
+existing contextual, per-item hashtag variety (`#SSDDeals`,
+`#BaldursGate3`, `#GamingMonitor`, etc.) — that variety was judged a real
+differentiator worth keeping. `_hashtags_look_reasonable()` is a light
+sanity check (≤4 tags, well-formed), not an allow-list. If this comes up
+again, that's a considered decision, not an oversight.
+
+**Spec extraction (2026-08-16):** `extract_clean_specs()` turns a messy
+retail title (e.g. `"Crucial P3 Plus 2TB PCIe Gen4 3D NAND NVMe M.2 SSD,
+up to 5000MB/s - CT2000P3PSSD8"`) into a clean product name plus 0-4 short
+technical specs, feeding both the Discord embed (a "Specs" field) and the
+caption prompt above. **Woot/Best Buy only** — Steam titles are already
+clean and don't have hardware specs to extract; gated on
+`deal["source"] != "Steam"` in `_process_deals()`. Deliberately validates
+0-4 specs, not a forced minimum — a genuinely low-info title should get an
+honest empty list, not an invented one; confirmed in testing the model
+does this correctly on its own (a generic HDMI cable title correctly came
+back with `"specs": []`). Fails open per-field: an overlong title falls
+back to the raw title independently of whether the specs in the same
+response were otherwise valid, and vice versa.
+
+**Desirability classifier (SHADOW MODE ONLY, not gating
 anything yet):** `classify_desirable_deals()` — one batched call per run,
 judging every deal that *actually posted* this run as KEEP or DROP (would
 a PC-building/gaming enthusiast genuinely want this, vs. generic/off-brand
@@ -168,7 +220,8 @@ Plain tuning config → **Variables** (visible/editable later, correctly
 *not* secret): `MIN_DISCOUNT_PERCENT`, `MIN_DOLLAR_SAVINGS`,
 `BLUESKY_MIN_DISCOUNT_PERCENT`, `BLUESKY_MAX_POSTS_PER_RUN`,
 `PRICE_HISTORY_MIN_DAYS`, `PRICE_HISTORY_TOLERANCE_PERCENT`,
-`OPENROUTER_PRIMARY_MODEL`, `OPENROUTER_FALLBACK_MODEL`.
+`OPENROUTER_PRIMARY_MODEL`, `OPENROUTER_FALLBACK_MODEL`,
+`OPENROUTER_SPEC_EXTRACTION_MODEL`.
 
 These were **originally all put in Secrets** (including the tuning
 numbers), which was wrong — Secrets can never be viewed again after
@@ -180,6 +233,29 @@ Local `.env` (gitignored, never committed — verified multiple times via
 `git log --all --full-history -- .env`) mirrors all of the above for local
 runs. `.env.example` is the committed, values-blank template — keep it in
 sync when adding new config.
+
+## Testing (added 2026-08-16)
+
+Before this, the project had zero automated tests — every feature was
+verified via live, real API calls during development instead (a
+deliberate practice throughout, not a gap; kept doing this alongside the
+new tests, not instead of them). Now there's a stdlib `unittest` suite,
+no new dependency:
+
+- `tests/test_spec_extraction.py` — 13 tests.
+- `tests/test_deal_verdict.py` — 11 tests.
+- **24 tests total**, run via `python -m unittest discover -s tests -p
+  "test_*.py"` (or `pytest tests/` if pytest happens to be installed
+  locally — it isn't by default, and isn't a project dependency).
+- Wired into `.github/workflows/deal_bot.yml` as a step named "Run Unit
+  Tests," ahead of the actual bot execution. The bot-run step has
+  `if: always()` so a test failure shows up clearly (red step in the
+  Actions log) but can **never silently block the scheduled run** — this
+  matters a lot for something meant to run unattended; a broken test
+  silently preventing all deal-finding for days, with the only symptom
+  being an absence of activity, is exactly the failure mode
+  `run_log`/`RUN_LOG_WEBHOOK_URL` already exist to prevent elsewhere in
+  this project.
 
 ## Bugs found and fixed this session (context for future debugging)
 
@@ -217,6 +293,21 @@ sync when adding new config.
    plus generous `max_tokens` floors — different floors needed for
    captions (350) vs. classification (`300 + 15/item`, capped at 1500);
    the classification task needed more headroom than captions did.
+8. **The spec-extraction model needed the opposite reasoning fix from #7**
+   — for `google/gemini-2.5-flash-lite`, setting *any* explicit reasoning
+   effort (even "low") reliably burned the whole token budget and
+   returned truncated garbage instead of JSON; *omitting* the parameter
+   entirely was what made it reliable. This is why `_call_openrouter()`
+   takes `reasoning` as an explicit opt-in per call rather than a fixed
+   default — don't assume the #7 fix generalizes to a new model without
+   testing it.
+9. **The caption "verdict" upgrade (2026-08-16) hit a truncation bug at
+   the old token budget** — the new prompt ("explain *why* this is
+   noteworthy") is a more demanding task than the old "write an engaging
+   caption," and needed more headroom even at low reasoning effort (350 →
+   600 `max_tokens`) or it would cut off mid-sentence. Confirmed reliable
+   across 9 repeated real-API test calls after the fix, with no
+   hallucinated specs in any of them.
 
 ## Design principles established (worth preserving)
 
@@ -235,6 +326,15 @@ sync when adding new config.
   everything else in Variables.
 - Commit messages explain *why*, not just *what*; one logical change per
   commit; compile-check and live-verify before and after every push.
+- **Don't assume a reasoning-effort fix generalizes to a new model** — it
+  didn't, twice (bugs #7 vs #8, and #7 vs #9). Test empirically per model
+  and per task, every time.
+- **Prefer real model-chosen variety over a fixed vocabulary when the
+  variety itself has been shown to add value** — the hashtag allow-list
+  question (declined) is the concrete example; don't reintroduce a fixed
+  list here without re-litigating that decision deliberately.
+- **A new automated test suite should never be able to silently block the
+  thing it's protecting** — see the Testing section's `if: always()` note.
 
 ## Open items / next steps
 
@@ -253,6 +353,12 @@ sync when adding new config.
   `gh run list` history for a pattern.
 - **Dev → prod channel flip** — whenever ready, this is a Discord privacy
   setting change on the existing channels, not a code change.
+- **Webhook false-negative dedupe gap** — if a Discord webhook call
+  actually succeeds server-side but the HTTP response is lost before the
+  code sees it, `seen_deals` never gets updated for that deal, and since
+  state persists across runs, it could look "never posted" on a *future*
+  run and genuinely post twice. Rare (needs a network failure at exactly
+  the wrong moment), real, not fixed.
 - Old `price_history` rows retain `observed_date = NULL` (pre-dates the
   schema fix) — harmless, a real backfill would need to also collapse the
   historical duplicate rows first, deliberately not done.
