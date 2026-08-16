@@ -57,6 +57,7 @@ NOTES
 
 import os
 import re
+import json
 import time
 import argparse
 from pathlib import Path
@@ -131,6 +132,20 @@ SHADOW_CLASSIFIER_WEBHOOK_URL = os.environ.get("SHADOW_CLASSIFIER_WEBHOOK_URL", 
 OPENROUTER_CLASSIFIER_SYSTEM_PROMPT = """You screen deal listings for a bot that posts discounts to an audience of PC-building and PC-gaming enthusiasts. For each numbered item below, decide whether it is something that audience would genuinely want — not just topically related (e.g. "electronics"), but actually desirable: recognizable brands, real PC parts, monitors, peripherals, games, and similar. Reject generic, off-brand, or low-interest items even if they're topically in-category.
 
 Respond with exactly one line per item, in the same order as the input, containing only the word KEEP or DROP — nothing else. No numbering, no explanation, no extra text. The number of output lines must exactly match the number of input items."""
+
+# Spec extraction — cleans up messy retail titles (Woot/Best Buy only;
+# Steam game titles are already clean and don't have "specs" to extract)
+# into a concise product name plus a few short technical specs, for the
+# Discord embed and captions. See extract_clean_specs().
+OPENROUTER_SPEC_EXTRACTION_MODEL = os.environ.get("OPENROUTER_SPEC_EXTRACTION_MODEL", "google/gemini-2.5-flash-lite")
+SPEC_EXTRACTION_SYSTEM_PROMPT = """You clean up messy retail product titles for a deal-finding bot focused on PC hardware and electronics. Given a raw title (and optional description), extract a clean, concise product name and up to 4 short technical specs.
+
+Rules:
+- Never invent a spec that isn't explicitly present or clearly implied in the input. If there is genuinely nothing worth calling out, return an empty specs list — do not pad it with anything invented.
+- clean_title: the product name and model, stripped of SEO keyword clutter, under 100 characters.
+- specs: 0 to 4 short strings (e.g. "Capacity: 2TB", "Interface: PCIe Gen4"), each under 60 characters.
+
+Respond with only a JSON object in this exact shape: {"clean_title": string, "specs": [string, ...]}"""
 
 # Woot feeds that map to your electronics/gaming focus.
 # Valid options: All, Clearance, Computers, Electronics, Featured, Home,
@@ -555,17 +570,20 @@ EMBED_USE_LARGE_IMAGE = False
 
 def build_embed(deal: dict) -> dict:
     discount = deal["discount_pct"]
+    # AI-cleaned title when available (see extract_clean_specs), raw
+    # title otherwise — never blocks on this being present.
+    display_title = deal.get("clean_title") or deal["title"]
 
     # Color-code by deal quality, and flag standout deals in the title.
     if discount is not None and discount >= 50:
         color = 0xE74C3C  # red — hot deal
-        title = f"🔥 {deal['title'][:245]}"
+        title = f"🔥 {display_title[:245]}"
     elif discount is not None and discount >= 35:
         color = 0x2ECC71  # green — great deal
-        title = f"✅ {deal['title'][:245]}"
+        title = f"✅ {display_title[:245]}"
     else:
         color = 0x3498DB  # blue — solid deal
-        title = deal["title"][:250]
+        title = display_title[:250]
 
     price_value = f"**${deal['sale_price']:.2f}**"
     if deal["list_price"]:
@@ -588,6 +606,16 @@ def build_embed(deal: dict) -> dict:
             "name": "Lowest Seen",
             "value": f"${deal['lowest_price']:.2f} ({low_date})",
             "inline": True,
+        })
+
+    # AI-extracted specs (Woot/Best Buy only — see extract_clean_specs),
+    # rendered as a bulleted block. Empty/absent whenever extraction
+    # failed or genuinely found nothing worth calling out.
+    if deal.get("specs"):
+        fields.append({
+            "name": "Specs",
+            "value": "\n".join(f"• {s}" for s in deal["specs"]),
+            "inline": False,
         })
 
     embed = {
@@ -722,15 +750,42 @@ def build_x_caption(deal: dict) -> str:
     price = f"${deal['sale_price']:.2f}"
     if deal["list_price"]:
         price += f" (was ${deal['list_price']:.2f})"
-    return f"{discount} — {deal['title']} — {price}\n{deal['url']}"
+    display_title = deal.get("clean_title") or deal["title"]
+    return f"{discount} — {display_title} — {price}\n{deal['url']}"
 
 
 def _call_openrouter(
     model: str, system_prompt: str, user_prompt: str,
     *, temperature: float = 0.8, max_tokens: int = 350,
+    reasoning: dict | None = None, response_format: dict | None = None,
+    timeout: int = 20,
 ) -> str | None:
+    """`reasoning` and `response_format` are opt-in per call, not
+    defaulted — different models on OpenRouter behave oppositely here.
+    Captions/classification use reasoning-capable models where setting
+    `{"effort": "low"}` is what prevents them from burning their whole
+    token budget on internal reasoning (confirmed in testing: the free
+    fallback model failed 0/5 calls without it). Spec extraction uses a
+    different model where the opposite is true — setting *any* reasoning
+    effort, even "low", reliably burned the whole budget and returned
+    truncated garbage instead of JSON; omitting the parameter entirely
+    was what made it reliable. So every caller states explicitly what it
+    needs rather than this function guessing for all models at once."""
     if not OPENROUTER_API_KEY:
         return None
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if reasoning is not None:
+        payload["reasoning"] = reasoning
+    if response_format is not None:
+        payload["response_format"] = response_format
     try:
         resp = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -738,25 +793,8 @@ def _call_openrouter(
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                # Both models here are reasoning models: part of the token
-                # budget goes to an internal reasoning trace before the
-                # actual answer. Without capping effort, a model can burn
-                # the entire budget on it and leave content null —
-                # reliably reproduced in testing with the free fallback
-                # model at 0/5 successful calls before this was added.
-                # "low" effort plus generous max_tokens (still fractions
-                # of a cent either way) fixed that.
-                "max_tokens": max_tokens,
-                "reasoning": {"effort": "low"},
-                "temperature": temperature,
-            },
-            timeout=20,
+            json=payload,
+            timeout=timeout,
         )
     except requests.RequestException as e:
         print(f"[openrouter] request failed for model {model}: {e}")
@@ -791,16 +829,20 @@ def build_ai_caption(deal: dict) -> str:
     price = f"${deal['sale_price']:.2f}"
     if deal["list_price"]:
         price += f" (was ${deal['list_price']:.2f})"
+    display_title = deal.get("clean_title") or deal["title"]
     user_prompt = (
         f"Deal source: {deal['source']}\n"
-        f"Item: {deal['title']}\n"
+        f"Item: {display_title}\n"
         f"Discount: {discount}\n"
         f"Price: {price}\n\n"
         "Write the caption."
     )
 
     for model in (OPENROUTER_PRIMARY_MODEL, OPENROUTER_FALLBACK_MODEL):
-        caption = _call_openrouter(model, OPENROUTER_CAPTION_SYSTEM_PROMPT, user_prompt, temperature=0.8)
+        caption = _call_openrouter(
+            model, OPENROUTER_CAPTION_SYSTEM_PROMPT, user_prompt,
+            temperature=0.8, reasoning={"effort": "low"},
+        )
         if caption and len(caption) <= 260:  # sanity ceiling before trusting it
             return f"{caption}\n{deal['url']}"
         if caption:
@@ -841,7 +883,7 @@ def classify_desirable_deals(deals: list[dict]) -> tuple[list[dict], list[dict],
     for model in (OPENROUTER_PRIMARY_MODEL, OPENROUTER_FALLBACK_MODEL):
         response = _call_openrouter(
             model, OPENROUTER_CLASSIFIER_SYSTEM_PROMPT, user_prompt,
-            temperature=0.1, max_tokens=max_tokens,
+            temperature=0.1, max_tokens=max_tokens, reasoning={"effort": "low"},
         )
         if not response:
             continue
@@ -858,6 +900,62 @@ def classify_desirable_deals(deals: list[dict]) -> tuple[list[dict], list[dict],
 
     print("[openrouter] classifier unavailable from both models this run — no shadow report")
     return list(deals), [], None
+
+
+def extract_clean_specs(title: str, description: str = "") -> dict:
+    """Cleans up a messy retail title into a concise product name plus up
+    to 4 short technical specs, via OpenRouter (see
+    OPENROUTER_SPEC_EXTRACTION_MODEL). Fails open at every stage: no API
+    key, a network error, malformed JSON, or an unusable top-level
+    response all fall back to {"clean_title": title, "specs": []}. A
+    single bad field (e.g. a valid specs list but an overlong title)
+    falls back only for that field, keeping whatever's usable. Must never
+    be able to block a post."""
+    fallback = {"clean_title": title, "specs": []}
+
+    user_prompt = f"Title: {title}"
+    if description:
+        user_prompt += f"\nDescription: {description}"
+
+    content = _call_openrouter(
+        OPENROUTER_SPEC_EXTRACTION_MODEL, SPEC_EXTRACTION_SYSTEM_PROMPT, user_prompt,
+        temperature=0.0, max_tokens=200, timeout=5,
+        response_format={"type": "json_object"},
+        # Deliberately omitted: reasoning. Unlike the caption/classifier
+        # models above, this model reliably burned its entire token
+        # budget on internal reasoning when any effort level was set
+        # (confirmed in testing — 192-332 of ~200-350 tokens spent on
+        # reasoning, returning truncated garbage instead of JSON).
+        # Omitting the parameter entirely is what made it reliable.
+    )
+    if not content:
+        return fallback
+
+    try:
+        parsed = json.loads(content)
+    except (ValueError, TypeError) as e:
+        print(f"[openrouter] spec extraction response didn't parse as JSON: {e}")
+        return fallback
+    if not isinstance(parsed, dict):
+        print(f"[openrouter] spec extraction response wasn't a JSON object: {parsed!r}")
+        return fallback
+
+    clean_title = parsed.get("clean_title")
+    if isinstance(clean_title, str) and clean_title.strip() and len(clean_title.strip()) <= 100:
+        clean_title = clean_title.strip()
+    else:
+        print(f"[openrouter] spec extraction clean_title failed validation: {clean_title!r}")
+        clean_title = title
+
+    specs = parsed.get("specs")
+    if (isinstance(specs, list) and len(specs) <= 4
+            and all(isinstance(s, str) and s.strip() and len(s.strip()) <= 60 for s in specs)):
+        specs = [s.strip() for s in specs]
+    else:
+        print(f"[openrouter] spec extraction specs failed validation: {specs!r}")
+        specs = []
+
+    return {"clean_title": clean_title, "specs": specs}
 
 
 SOURCE_WEBHOOKS = {
@@ -1197,6 +1295,21 @@ def _process_deals(
             deal["lowest_price"] = deal["sale_price"]
             deal["lowest_price_date"] = datetime.now(timezone.utc).isoformat()
         deal["is_new_low"] = is_new_low
+
+        # Clean title + short spec extraction — Woot/Best Buy only. Steam
+        # titles ("Elden Ring") are already clean and don't have hardware
+        # specs to extract; forcing the schema on them would either
+        # produce nothing meaningful or pressure the model into
+        # inventing something, which is exactly what this is meant to
+        # avoid. Fails open (see extract_clean_specs) so this can never
+        # block a post.
+        if deal["source"] != "Steam":
+            spec_result = extract_clean_specs(deal["title"])
+            deal["clean_title"] = spec_result["clean_title"]
+            deal["specs"] = spec_result["specs"]
+        else:
+            deal["clean_title"] = deal["title"]
+            deal["specs"] = []
 
         if post_to_discord(deal):
             seen[deal["id"]] = {
