@@ -21,7 +21,18 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - run: python deal_bot.py
+      - name: Run Unit Tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      # Runs even if the tests above failed (if: always()) — a test
+      # regression should be visible (the step above shows red), but
+      # must never be able to silently block the scheduled run itself.
+      # That's the failure mode run_log/RUN_LOG_WEBHOOK_URL exist to
+      # prevent: an unattended pipeline going quiet with nothing to
+      # notice except the absence of activity.
+      - name: Run deal_bot.py
+        if: always()
+        run: python deal_bot.py
         env:
           WOOT_API_KEY: ${{ secrets.WOOT_API_KEY }}
           BESTBUY_API_KEY: ${{ secrets.BESTBUY_API_KEY }}

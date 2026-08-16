@@ -115,14 +115,16 @@ BLUESKY_MAX_POSTS_PER_RUN = int(os.environ.get("BLUESKY_MAX_POSTS_PER_RUN", "2")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_PRIMARY_MODEL = os.environ.get("OPENROUTER_PRIMARY_MODEL", "deepseek/deepseek-v4-flash-0731")
 OPENROUTER_FALLBACK_MODEL = os.environ.get("OPENROUTER_FALLBACK_MODEL", "openai/gpt-oss-20b:free")
-OPENROUTER_CAPTION_SYSTEM_PROMPT = """You write short, engaging social media captions for a deal-finding bot that posts real-time discounts on PC hardware, electronics, and PC games.
+OPENROUTER_CAPTION_SYSTEM_PROMPT = """You write short, data-backed technical verdicts for a deal-finding bot aimed at PC builders and PC gamers — not marketing copy. You'll be given a product's clean title, its known specs (if any), current and list price, and price-history context (whether this is a new all-time low, or what the lowest tracked price has been).
 
-Output ONLY the caption text — no preamble, no explanation, no quotation marks, no markdown formatting, no code fences.
+Output ONLY the verdict text — no preamble, no explanation, no quotation marks, no markdown formatting, no code fences.
 
-Keep the entire output under 200 characters. Mention the discount and price naturally, not as a bare stat dump. End with 2 to 4 relevant, space-separated hashtags chosen specifically for the item — vary them based on what the deal actually is. Never include a URL or link.
+Write exactly 1-2 concise sentences explaining *why* this deal is actually noteworthy — a real price-history signal (e.g. a genuine all-time low), real value-for-money given the specs you were given, or a specific use case those specs support. Take a direct, analytical, enthusiast tone. Do not use hype phrases like "insane deal," "don't miss out," or "act now." Never state a spec, benchmark number, or feature that wasn't explicitly given to you — if you don't have enough information to say something specific and true, keep it simple rather than inventing detail.
 
-Example:
-🔥 55% off this ASUS 27" gaming monitor — now $189.99, was $429.99. Big drop for a 165Hz panel. #PCBuild #GamingDeals #TechDeals"""
+Keep the entire output under 200 characters. End with 2 to 4 relevant, space-separated hashtags chosen specifically for this item — vary them based on what the deal actually is, don't reuse the same generic tags every time. Never include a URL or link.
+
+Example, given a 2TB PCIe Gen4 NVMe SSD at a new all-time low of $79.99 (was $159.99):
+This is the lowest we've tracked this 2TB PCIe Gen4 drive — a genuine all-time low, not just a markdown. Fast NVMe storage at a real floor price. #PCBuild #SSDDeals #TechDeals"""
 
 # SHADOW MODE: reports what the desirability classifier (see
 # classify_desirable_deals) would have kept/dropped, without actually
@@ -824,29 +826,51 @@ def build_ai_caption(deal: dict) -> str:
     the plain build_x_caption() template if both fail or OPENROUTER_API_KEY
     isn't set — this must never be able to block a post from going out.
     The URL is deliberately not part of the prompt; it's appended here in
-    code so the LLM can't alter it and break the Bluesky link facet."""
+    code so the LLM can't alter it and break the Bluesky link facet.
+
+    Feeds the model concrete, already-verified signals (clean title,
+    specs, and price-history context from Supabase) so it acts as an
+    analytical synthesizer of real data rather than an ungrounded
+    copywriter — see OPENROUTER_CAPTION_SYSTEM_PROMPT."""
     discount = f"{deal['discount_pct']}% off" if deal["discount_pct"] else "On sale"
     price = f"${deal['sale_price']:.2f}"
     if deal["list_price"]:
         price += f" (was ${deal['list_price']:.2f})"
     display_title = deal.get("clean_title") or deal["title"]
-    user_prompt = (
-        f"Deal source: {deal['source']}\n"
-        f"Item: {display_title}\n"
-        f"Discount: {discount}\n"
-        f"Price: {price}\n\n"
-        "Write the caption."
-    )
+    specs = deal.get("specs") or []
+
+    prompt_lines = [
+        f"Deal source: {deal['source']}",
+        f"Item: {display_title}",
+    ]
+    if specs:
+        prompt_lines.append(f"Known specs: {', '.join(specs)}")
+    prompt_lines.append(f"Discount: {discount}")
+    prompt_lines.append(f"Price: {price}")
+    # Price-history context from Supabase (see _process_deals) — only
+    # ever a fact the model is told, never something it has to infer.
+    if deal.get("is_new_low"):
+        prompt_lines.append("Price history: this is a new all-time low for this exact item.")
+    elif deal.get("lowest_price") is not None and deal["lowest_price"] < deal["sale_price"]:
+        prompt_lines.append(f"Price history: the lowest ever tracked for this item was ${deal['lowest_price']:.2f}.")
+    prompt_lines.append("")
+    prompt_lines.append("Write the verdict.")
+    user_prompt = "\n".join(prompt_lines)
 
     for model in (OPENROUTER_PRIMARY_MODEL, OPENROUTER_FALLBACK_MODEL):
         caption = _call_openrouter(
             model, OPENROUTER_CAPTION_SYSTEM_PROMPT, user_prompt,
-            temperature=0.8, reasoning={"effort": "low"},
+            # "Explain why this is actually noteworthy" is a more
+            # demanding ask than the old "write an engaging caption" —
+            # confirmed in testing this needs more headroom than 350
+            # tokens even at "low" reasoning effort, or it truncates
+            # mid-sentence before finishing (still fractions of a cent).
+            temperature=0.4, reasoning={"effort": "low"}, max_tokens=600,
         )
-        if caption and len(caption) <= 260:  # sanity ceiling before trusting it
+        if caption and len(caption) <= 260 and _hashtags_look_reasonable(caption):
             return f"{caption}\n{deal['url']}"
         if caption:
-            print(f"[openrouter] {model} response too long ({len(caption)} chars), trying next")
+            print(f"[openrouter] {model} caption failed validation (len={len(caption)}), trying next")
 
     return build_x_caption(deal)  # last resort: mechanical template
 
@@ -1036,6 +1060,16 @@ def _build_tag_facets(text: str) -> list[dict]:
             "features": [{"$type": "app.bsky.richtext.facet#tag", "tag": tag_name}],
         })
     return facets
+
+
+def _hashtags_look_reasonable(text: str) -> bool:
+    """Light sanity check, not a hard allow-list — the model is trusted
+    to pick contextually relevant hashtags per item (deliberately: real
+    output like #SSDDeals, #BaldursGate3, #GamingMonitor is more useful
+    than a fixed generic vocabulary would be), this just catches
+    obviously broken or spammy output before it posts."""
+    tags = _HASHTAG_PATTERN.findall(text)
+    return len(tags) <= 4 and all(1 <= len(tag) <= 30 for tag in tags)
 
 
 def _build_bluesky_embed(session: dict, deal: dict) -> dict | None:
