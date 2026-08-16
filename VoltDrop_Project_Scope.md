@@ -1,6 +1,6 @@
 # VoltDrop — Project Scope
 
-**Scope note:** this document covers the automated `deal_bot.py` pipeline specifically — everything in this document is drawn directly from verified work in this session (live API tests, real GitHub Actions runs, actual git history), not from external notes or unverified claims. Business-development topics (affiliate programs, manual curation workflows, brand/growth strategy) may exist elsewhere but are outside what this document can vouch for, and are deliberately not included here. For deep technical reference (exact schemas, commands, full bug list), see `HANDOFF.md` in this repo — this document is the higher-level narrative; that one is the operational reference.
+**Scope note:** §§1-7 and §11 (technical pipeline, bugs, AI features, testing, open items) are drawn directly from verified work in this session — live API tests, real GitHub Actions runs, actual git history. §§8-10 (affiliate programs, the manual Amazon workflow, brand/growth) cover business-development work outside the automated pipeline, reported by the operator rather than independently verified via this session's tool use — flagged inline where they appear. For deep technical reference on the pipeline itself (exact schemas, commands, full bug list), see `HANDOFF.md` in this repo — this document is the higher-level narrative; that one is the operational reference.
 
 **Repo:** https://github.com/jmocera/discord-deal-finder (private)
 
@@ -117,16 +117,59 @@ Previously, this project had zero automated tests — everything was verified vi
 
 ---
 
-## 8. Open items
+## 8. Affiliate programs
+
+*(Reported by the operator; not independently verified via this session's tool use — application/approval statuses can change without that being reflected here.)*
+
+| Program | Status | Notes |
+|---|---|---|
+| Amazon Associates | Approved and active. Tag: `voltdrop05-20` | Not wired into the automated pipeline — Amazon isn't a `deal_bot.py` data source. Applied manually via `?tag=` on manually-sourced links. |
+| CJ Affiliate (covers Woot) | Application submitted, under review | Response time reportedly inconsistent per Woot forums — could be weeks. |
+| Impact.com (covers Best Buy + Walmart) | Researched, not yet submitted | Recommended next step. |
+| Best Buy Developer API | Key requested, pending approval | Separate from the affiliate program above — this is data access, not commission (see §2). |
+| Newegg | No public affiliate path found | Real path would be an affiliate network (possibly CJ), not yet pursued. |
+| Steam | No affiliate program exists | Long-standing Valve policy — kept as a content-variety source only, not a monetization path. |
+
+**FTC disclosure:** `#ad` is applied on manual Amazon posts using the affiliate tag. **Not yet relevant to the automated pipeline** — none of Woot/Best Buy/Steam currently carry affiliate codes, since none of those programs are approved yet. This will need to be built into `deal_bot.py` once CJ/Impact.com approvals land (see §11).
+
+## 9. Manual deal-posting workflow (Amazon)
+
+*(Reported by the operator; entirely separate from `deal_bot.py` — Amazon isn't a scripted data source, so none of this runs through the automated pipeline.)*
+
+The operator sources deals manually via screenshots, drafting captions using only visible, real data. Credibility checklist applied to every manual find:
+
+- Sold & shipped by Amazon.com (not third-party) = green flag; a third-party seller combined with a thin review count (~20) = red flag.
+- Amazon's own "Typical price" (an algorithmic reference based on real sale history) is treated as more trustworthy than a seller-set "List Price," which can be inflated.
+- `#ad` required at the *front* of the post per FTC rules — `#partner`/`#collab` are explicitly not treated as sufficient substitutes.
+- Bluesky doesn't reliably generate link-preview cards for `amzn.to` links — worked around by manually attaching the product photo.
+
+## 10. Brand & growth
+
+*(Reported by the operator; non-technical, included for completeness.)*
+
+- Hashtag strategy differs by platform: on X, hashtags are treated as low-value under the current algorithm (0-1 max, `#ad` only when required); on Bluesky, hashtags genuinely power community-run custom feeds, but only after manually confirming a tag maps to a real, active feed via Bluesky's own Feeds-tab search rather than third-party trending tools.
+- X Premium adopted, with the expectation that it amplifies existing activity rather than creating growth on its own.
+- A link-placement A/B test (link-in-post vs. link-in-reply) is in progress; early data only, not yet conclusive.
+- A paid Discord membership tier (gating deal *quality*, not *source*) is planned conceptually, explicitly deferred until there's a real audience.
+
+---
+
+## 11. Open items
 
 1. **Best Buy API key still pending.** Code is ready; the query-encoding logic in particular has never been exercised against a real key and is worth a specific check once it arrives.
 2. **Shadow classifier not yet promoted to a real filter** — needs more real-world runs reviewed before trusting it to gate posts.
 3. **Webhook false-negative dedupe gap** (§5, item 8) — real, rare, not yet fixed.
 4. **One scheduled run was silently skipped by GitHub** with no root cause found (not an active GitHub incident, not a repo/billing issue) — a single occurrence so far, worth treating as a pattern if it recurs rather than a settled problem.
 5. **Reasoning-effort behavior is genuinely model-specific, not a fixed rule** — three different OpenRouter models needed three different configurations this session (see §5, item 6). Worth re-verifying empirically, not assuming, whenever a new model gets added to this pipeline.
+6. **No affiliate tagging or `#ad` disclosure exists yet on the automated pipeline's outputs** (Woot/Best Buy/Steam) — only manual Amazon posts currently carry disclosure (§9). This needs to be built into `deal_bot.py` before any of the pending affiliate programs (§8) can actually monetize those sources.
+7. **CJ Affiliate and Impact.com applications are both still pending/not started** — until either lands, the automated pipeline's Woot/Best Buy links have no monetization path even once #6 above is built.
 
 ---
 
 ## Handoff summary
 
-As of this session, `deal_bot.py` runs unattended on a 4-hour GitHub Actions schedule, pulling from Woot and Steam (Best Buy pending its API key), filtering through keyword/discount/price-history gates, and posting to 7 Discord channels and Bluesky. Two AI features are fully live and tested against real data: data-backed caption "verdicts" (upgraded today from generic marketing copy) and clean title/spec extraction (built today) — both fail open to safe defaults on any failure. A third AI feature, a desirability classifier, is deliberately running in observation-only shadow mode pending more real-world review. Bluesky posts carry rich link-preview cards and clickable hashtags via raw AT Protocol calls. A 24-test stdlib suite now runs in CI ahead of every scheduled execution, wired so a test failure is visible but can never silently block the unattended pipeline. Five open items remain (above), none blocking normal operation. For exact schemas, commands, and the full historical bug list, see `HANDOFF.md` in this repo.
+As of this session, `deal_bot.py` runs unattended on a 4-hour GitHub Actions schedule, pulling from Woot and Steam (Best Buy pending its API key), filtering through keyword/discount/price-history gates, and posting to 7 Discord channels and Bluesky. Two AI features are fully live and tested against real data: data-backed caption "verdicts" (upgraded today from generic marketing copy) and clean title/spec extraction (built today) — both fail open to safe defaults on any failure. A third AI feature, a desirability classifier, is deliberately running in observation-only shadow mode pending more real-world review. Bluesky posts carry rich link-preview cards and clickable hashtags via raw AT Protocol calls. A 24-test stdlib suite now runs in CI ahead of every scheduled execution, wired so a test failure is visible but can never silently block the unattended pipeline.
+
+Separately, on the business side (§§8-10, operator-reported): Amazon Associates is approved and active but only feeds the manual posting workflow, not the automated pipeline; CJ Affiliate (Woot) and Impact.com (Best Buy/Walmart) applications are pending/not yet submitted; and no affiliate tagging or FTC disclosure exists yet on any automated-pipeline output, which is a real gap to close before those programs can monetize Woot/Best Buy traffic once approved.
+
+Seven open items remain (§11), none blocking normal operation. For exact schemas, commands, and the full historical bug list, see `HANDOFF.md` in this repo.
