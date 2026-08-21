@@ -17,17 +17,20 @@ VoltDrop's automated side is a Python package (`deal_bot/`, run via `python -m d
                    ▼
             deal_bot (GitHub Actions, cron every 4h)
                    │
-   ┌───────────────┼────────────────────┬─────────────────┐
-   ▼               ▼                    ▼                 ▼
-Supabase      Discord webhooks (7)   Bluesky (AT       OpenRouter
-(seen_deals,  Woot / Best Buy /      Protocol, raw     (3 features —
-price_history, Steam / Digest /      REST, no SDK)     see §6)
-run_log)      Private queue /
-              Run Log / Shadow
-              Classifier
+   ┌───────────────┼─────────────────────────┬──────────────┬──────────┐
+   ▼               ▼                         ▼              ▼          ▼
+Supabase      Discord webhooks (7 + 3   Bluesky (AT    OpenRouter    Watchdog
+(seen_deals,  shadow) Woot / Best Buy / Protocol, raw   (captions,   (hourly
+price_history, Steam / Digest /        REST, no SDK)   spec+analysis, dead-man's
+run_log,       Run Log / Shadow                        classifier,  switch)
+posted_deals)  Classifier / Scorer /                   scorer,
+               Categorizer                              categorizer,
+                                                        weekly digest)
 ```
 
 Best Buy is currently dormant in the live pipeline — its API key is still pending approval as of this writing, so that source contributes zero deals until it's granted.
+
+Separately, three companion GitHub Actions workflows run off the main cadence: `weekly_digest.yml` (Mondays at noon — AI-written roundup of the week's posted deals), `watchdog.yml` (hourly — a dead-man's switch that alerts if the bot stops logging runs), and `keepalive.yml` (monthly — prevents GitHub auto-disabling the schedule triggers).
 
 ---
 
@@ -47,18 +50,23 @@ Filtering, in order: `WOOT_INCLUDE_KEYWORDS`/`WOOT_EXCLUDE_KEYWORDS` (Woot only)
 
 ## 3. Data persistence (Supabase)
 
-Chosen specifically because GitHub Actions runners are ephemeral — a local JSON file for dedupe state would never survive between scheduled runs. Three tables:
+Chosen specifically because GitHub Actions runners are ephemeral — a local JSON file for dedupe state would never survive between scheduled runs. Four tables:
 
 - **`seen_deals`** — dedupe state, keyed by deal ID (`source:id`), tracks last-seen price so a further price drop can re-trigger a post.
 - **`price_history`** — one row per deal *per day* (not per run — see §5 for why that distinction mattered), upserted on `(deal_id, observed_date)`.
 - **`run_log`** — one row per run, success or failure, with full counts — written even when the run crashes partway through, and mirrored live to a dedicated Discord channel (`RUN_LOG_WEBHOOK_URL`) so a failure is never silent.
+- **`posted_deals`** — append-only log of every deal that actually posted (with title/url/prices), written on each successful post; backs the weekly digest and is pruned on a 90-day TTL.
+
+All Supabase access goes through a single shared HTTP transport (`deal_bot/transport.py`) with bounded retry/backoff, so a transient blip can't silently produce an empty seen-map and double-post.
 
 ---
 
 ## 4. Deployment
 
-- **GitHub Actions** (`.github/workflows/deal_bot.yml`): `cron: "0 */4 * * *"`, `workflow_dispatch` for manual runs, Python 3.13, 15-minute timeout.
-- **`keepalive.yml`**: a separate workflow, runs monthly, pushes an empty commit — GitHub auto-disables a workflow's *schedule* trigger after 60 days of no git commit activity (workflow runs don't count toward that), so this exists purely to keep the schedule itself from silently lapsing.
+- **GitHub Actions** (`.github/workflows/deal_bot.yml`): `cron: "0 */4 * * *"`, `workflow_dispatch` for manual runs, Python 3.13, 15-minute timeout. The posting pipeline is phased (deterministic filter → batched AI enrichment → post loop) — the split that will let the shadow AI judges gate posts later.
+- **`weekly_digest.yml`**: Mondays at noon UTC; runs `deal_bot.weekly_digest` (AI roundup of `posted_deals` to the digest channel + Bluesky). Has a `no_bluesky` dispatch input for safe E2E testing.
+- **`watchdog.yml`**: hourly dead-man's switch (`deal_bot.watchdog`) — alerts if no `run_log` row lands within 6h.
+- **`keepalive.yml`**: runs monthly, pushes an empty commit — GitHub auto-disables a workflow's *schedule* trigger after 60 days of no git commit activity (workflow runs don't count toward that), so this exists purely to keep the schedule itself from silently lapsing.
 - **CI test step** (added today, see §7): runs the unit test suite before the bot executes. Deliberately wired with `if: always()` on the bot-execution step, so a test regression is visible (shows as a distinct failed step) but can never silently prevent the actual scheduled run — consistent with everything else built here to make failures loud, not silent.
 - **Secrets vs. Variables**: real credentials (API keys, webhook URLs, `SUPABASE_SERVICE_KEY`, `BLUESKY_APP_PASSWORD`, `OPENROUTER_API_KEY`) are GitHub *Secrets*. Plain tuning numbers and model names (`MIN_DISCOUNT_PERCENT`, `OPENROUTER_PRIMARY_MODEL`, etc.) are GitHub *Variables* — this split was corrected mid-project after the tuning values were initially, incorrectly stored as write-only Secrets.
 - **`.env` was never committed to git** — verified via three independent methods (`git log --all --full-history`, `git ls-files`, a direct GitHub API 404 on the file path).
@@ -78,12 +86,17 @@ Chosen specifically because GitHub Actions runners are ephemeral — a local JSO
    - The caption feature hit this a second time today, in a different form: upgrading the prompt to require *analytical reasoning* ("explain why this is noteworthy") rather than plain creative writing pushed token consumption higher even at low effort, causing mid-sentence truncation at the old budget. Fixed by raising the budget; confirmed reliable across 9 repeated real-API test calls afterward.
 7. **A double-post safety net that worked, but only by accident**: investigated whether the Woot cross-feed duplication (see #3) could have caused an actual duplicate *post*, not just a duplicate database row. Traced through the real posting loop and confirmed it couldn't, under normal conditions — but the reason was an in-memory dict update that happened to run before the second copy was checked, not a deliberate guard. The dedup fix (#3) converted this from "usually true, by luck" to "structurally can't happen."
 8. **A related, still-open gap, not yet fixed**: `seen_deals` only gets updated inside a successful-post branch. If a webhook call actually succeeds server-side but the HTTP response is lost before the code sees it, the dedupe state never updates — and since it persists across runs via Supabase, that specific item could look "never posted" on a *future* run and genuinely post twice. Rare (requires a network failure at exactly the wrong moment), not fixed, worth scoping at some point.
+9. **PostgREST rejects an unbounded DELETE (2026-08-21)** — the weekly digest's `--clear` initially sent a DELETE with no WHERE clause and got HTTP 400. Fixed by scoping to seed rows (`id` `like 'seed:%'`).
+10. **`load_seen` silently failing was a double-post risk (2026-08-21)** — a transient Supabase failure returned `{}`, so every deal looked new. Now returns `None` on a hard failure and `run_once` bails and logs before fetching feeds.
+11. **A broken test setUp/tearDown cascaded config mutations (2026-08-21)** — a filtering test saved only some threshold values, so its tearDown raised and left mutated config leaking into later test modules. Fixed by saving all four thresholds and pinning a deterministic baseline.
+
+(§5 is the deep bug list; HANDOFF.md's "Bugs found and fixed this session" is the same list with more line-level detail.)
 
 ---
 
-## 6. AI features (OpenRouter) — three distinct, independently-tested features
+## 6. AI features (OpenRouter)
 
-All three share a fail-open design principle: any failure (missing key, network error, malformed response, failed validation) falls back to a safe default rather than blocking a post or breaking a run.
+All AI features share a fail-open design principle: any failure (missing key, network error, malformed response, failed validation) falls back to a safe default rather than blocking a post or breaking a run. The three original features are detailed below; newer ones are summarized. For current model choices see HANDOFF.md's OpenRouter section.
 
 ### 6.1 AI-written captions → upgraded today to data-backed "verdicts"
 
@@ -105,16 +118,34 @@ Three-tier fallback: primary paid model → free fallback model → a plain mech
 
 Separately, Bluesky posts carry a real link-preview card (downloaded product image, uploaded as a blob, attached as an `app.bsky.embed.external` card) and clickable hashtag facets — both implemented via raw AT Protocol REST calls, no new dependency (consistent with the rest of the project's minimal-dependency approach; the official `atproto` SDK was considered and explicitly declined for this reason).
 
+### 6.5 Features added later (2026-08-21)
+
+- **Deal quality scorer** (`ai/deal_scorer.py`) — SHADOW MODE. One batched call per run rating each posted deal 1-10 for a PC-building/gaming audience; would drop deals below `MIN_QUALITY_SCORE`, but gates nothing yet.
+- **Deal analysis** (ai/deal_analyst.py) — LIVE. A 2-3 sentence "why this is noteworthy" block added to the Discord embed's "Analysis" field; batched with a per-item fallback.
+- **Category tagger** (ai/categorizer.py) — SHADOW MODE. Tags each posted deal into storage/display/component/peripheral/game/other; not yet used to gate or route.
+- **Weekly digest** (weekly_digest.py) — a Monday AI-written roundup from the `posted_deals` table.
+
+Spec extraction + analysis run **batched** (one OpenRouter call per phase, per-item fallback), which is the dominant per-run latency/cost control as deal volume grows.
+
+### 6.6 Reliability underpinnings (2026-08-21)
+
+A shared `deal_bot/transport.py` gives every outbound call bounded retry/backoff (plus the `load_seen`→`None` bail and the hourly `watchdog` heartbeat). Details in HANDOFF.md's Reliability section.
+
 ---
 
 ## 7. Testing infrastructure
 
 Previously, this project had zero automated tests — everything was verified via live, real API calls during development (a deliberate, consistent practice throughout, not a gap). A stdlib `unittest` suite was added (no new dependency — runnable via `python -m unittest discover -s tests` or `pytest tests/` if pytest happens to be installed), and has grown alongside each AI feature as it shipped: Feature 1 (clean title/spec extraction, §6.3), Feature 2 (data-backed deal verdicts, §6.1), and now Feature 3 (the Amazon vetting assistant, §9.1) each landed with its own dedicated test file rather than the suite trailing the code:
 
-- **`tests/test_spec_extraction.py` — 13 tests**: valid extraction, honest zero-spec responses, missing API key, network timeout, HTTP 500, malformed JSON, non-object JSON, oversized title/spec fields, too-many-specs, and (via the real pipeline code path, not a reimplemented condition) the Steam-skip logic.
-- **`tests/test_deal_verdict.py` — 11 tests**: price-history context (`is_new_low`, known floor price) actually reaching the prompt, specs reaching the prompt, fallback on model failure/oversized output/spammy hashtags, contextual hashtags being preserved rather than restricted, and the 300-character Bluesky limit holding under the new caption style.
-- **`tests/test_amazon_vetting.py` — 66 tests** (new, `vet_amazon_deal.py` / Feature 3, see §9.1): ASIN extraction across `dp/`, `gp/product/`, query-param, and shortened-URL forms; canonical-URL construction; strict per-field JSON validation with no type coercion (including the `bool`-is-a-subclass-of-`int` trap); every branch of the deterministic risk assessment (seller type, review count, rating, real-vs-fake discount, and multi-warning cases); `#ad`-first copy formatting for both Discord and Bluesky, including under 300-character truncation; the shared `_call_openrouter` fail-open paths (missing key, timeout, HTTP 500, empty content, code-fence-wrapped JSON) for both text and multimodal (vision) payload shapes; the full `vet_from_text`/`vet_from_image` pipelines; best-effort page fetch with no bot-detection evasion; and CLI URL-vs-text mode routing.
-- **90 tests total, all passing**, confirmed locally (`python -m unittest discover -s tests -p "test_*.py"`) and verified on real GitHub Actions infrastructure for the pre-existing 24; the new 66 are wired into the same CI step (`.github/workflows/deal_bot.yml` already discovers any `test_*.py` file under `tests/`, so no workflow change was needed) but that specific CI run had not yet been observed green as of this doc update — see §11.
+- **`tests/test_spec_extraction.py`** — spec extraction (per-deal + the batched path), and via the real `_process_deals` code path the Steam-skip logic.
+- **`tests/test_deal_verdict.py`** — caption "verdict" prompt context, fallbacks, and Bluesky length limits.
+- **`tests/test_amazon_vetting.py`** — the standalone Amazon vetting tool (Feature 3, §9.1): ASIN extraction, canonicalization, strict field validation, deterministic risk assessment, `#ad`-first copy, and the shared client fail-open paths.
+- **`tests/test_deal_scorer.py`** / **`tests/test_categorizer.py`** — the shadow AI features' parse + fail-open behavior.
+- **`tests/test_deal_analyst.py`** / **`tests/test_weekly_digest.py`** — the analyst and the weekly digest (fetch/prune/seed/clear, retry behavior, dry-run, exit codes).
+- **`tests/test_pipeline.py`** — the phased pipeline: `_skip_reason` boundaries, `run_once`'s `load_seen`-None bail, and the batch spec/analysis fallbacks.
+- **`tests/test_watchdog.py`** — the dead-man's switch: freshness/staleness and the `run_log` ordering query.
+
+**171 tests total, all passing** (`python -m unittest discover -s tests -p "test_*.py"`), wired into CI ahead of the bot run with `if: always()` so a regression is visible but can never silently block the scheduled execution.
 
 ---
 
@@ -171,20 +202,20 @@ A standalone CLI that formalizes the checklist above into a repeatable tool, rat
 ## 11. Open items
 
 1. **Best Buy API key still pending.** Code is ready; the query-encoding logic in particular has never been exercised against a real key and is worth a specific check once it arrives.
-2. **Shadow classifier not yet promoted to a real filter** — needs more real-world runs reviewed before trusting it to gate posts.
+2. **Shadow classifier not yet promoted to a real filter** — needs more real-world runs reviewed before trusting it to gate posts. The pipeline restructure that promotion needs (phased `_process_deals`) is **done**, so this is now purely gated on shadow-data review.
 3. **Webhook false-negative dedupe gap** (§5, item 8) — real, rare, not yet fixed.
-4. **One scheduled run was silently skipped by GitHub** with no root cause found (not an active GitHub incident, not a repo/billing issue) — a single occurrence so far, worth treating as a pattern if it recurs rather than a settled problem.
-5. **Reasoning-effort behavior is genuinely model-specific, not a fixed rule** — three different OpenRouter models needed three different configurations this session (see §5, item 6). Worth re-verifying empirically, not assuming, whenever a new model gets added to this pipeline.
-6. **No affiliate tagging or `#ad` disclosure exists yet on the automated pipeline's outputs** (Woot/Best Buy/Steam) — only manual Amazon posts currently carry disclosure (§9). **Still open after Feature 3** — `vet_amazon_deal.py` (§9.1) only touches the manual Amazon workflow; it has no connection to `deal_bot` and does nothing for Woot/Best Buy/Steam. This still needs to be built into `deal_bot` before any of the pending affiliate programs (§8) can actually monetize those sources.
+4. **One scheduled run was silently skipped by GitHub** with no root cause found (not an active GitHub incident, not a repo/billing issue) — a single occurrence so far. This failure mode is now surfaced by the hourly **watchdog** rather than left to "absence of activity."
+5. **Reasoning-effort behavior is genuinely model-specific, not a fixed rule** — three different OpenRouter models needed three different configurations (see §5, item 6), and the Gemma models needed a fourth (reasoning omitted). Worth re-verifying empirically, not assuming, whenever a new model gets added to this pipeline.
+6. **No affiliate tagging or `#ad` disclosure exists yet on the automated pipeline's outputs** (Woot/Best Buy/Steam) — only manual Amazon posts currently carry disclosure (§9). This still needs to be built into `deal_bot` before any of the pending affiliate programs (§8) can actually monetize those sources.
 7. **CJ Affiliate and Impact.com applications are both still pending/not started** — until either lands, the automated pipeline's Woot/Best Buy links have no monetization path even once #6 above is built.
-8. **`vet_amazon_deal.py` (§9.1) isn't yet a required step** — nothing stops the operator from posting an Amazon deal by hand without running it first. Adoption is a process/discipline question, not a code one; nothing in this pipeline currently enforces it.
-9. ~~This session's 66 new tests have not yet been observed passing in a real GitHub Actions run~~ — **resolved.** Manually triggered via `workflow_dispatch` (run `31971559541`, 2026-08-16 20:47 UTC): CI reported `Ran 90 tests ... OK`, and the subsequent live `deal_bot` step completed normally (308 deals checked, 0 posted this cycle — no unexpected production posts). No workflow changes were needed; `discover -s tests -p "test_*.py"` already picks up new files under `tests/` automatically.
+8. **`vet_amazon_deal.py` (§9.1) isn't yet a required step** — nothing stops the operator from posting an Amazon deal by hand without running it first. Adoption is a process/discipline question, not a code one.
+9. **`price_history` growth / `load_seen` pagination** — see HANDOFF's open items; fine at current volume, revisit before Best Buy roughly doubles deal count.
 
 ---
 
 ## Handoff summary
 
-As of this session, `deal_bot` runs unattended on a 4-hour GitHub Actions schedule, pulling from Woot and Steam (Best Buy pending its API key), filtering through keyword/discount/price-history gates, and posting to 7 Discord channels and Bluesky. Two AI features are fully live and tested against real data: data-backed caption "verdicts" (Feature 2, upgraded from generic marketing copy) and clean title/spec extraction (Feature 1) — both fail open to safe defaults on any failure. A third AI feature, a desirability classifier, is deliberately running in observation-only shadow mode pending more real-world review. Bluesky posts carry rich link-preview cards and clickable hashtags via raw AT Protocol calls. A 90-test stdlib suite is wired into the same CI step ahead of every scheduled execution (`if: always()` on the bot-execution step), so a test failure is visible but can never silently block the unattended pipeline.
+As of this session, `deal_bot` runs unattended on a 4-hour GitHub Actions schedule, pulling from Woot and Steam (Best Buy pending its API key), filtering through the phased pipeline (deterministic `_skip_reason` filter → batched AI spec/analysis → post loop), and posting to 7 Discord channels plus Bluesky. Live AI: data-backed caption "verdicts", clean title/spec extraction, and deal analysis — all routed through a shared retry/backoff transport. Shadow-mode AI (desirability classifier, quality scorer 1-10, category tagger) observes but gates nothing until enough real-world data is reviewed. An hourly **watchdog** heartbeat alerts if the bot ever stops logging runs. Bluesky posts carry rich link-preview cards and clickable hashtags via raw AT Protocol calls. A 171-test stdlib suite is wired into the same CI step ahead of every scheduled execution (`if: always()` on the bot-execution step), so a test failure is visible but can never silently block the unattended pipeline.
 
 Separately, a new standalone tool, `vet_amazon_deal.py` (Feature 3, §9.1), formalizes the operator's existing manual Amazon credibility checklist into a repeatable CLI — text/URL/screenshot ingestion via OpenRouter, deterministic (non-LLM) risk assessment, ASIN-based affiliate-link canonicalization (`voltdrop05-20`), and `#ad`-first ready-to-copy output. It is explicitly **not** part of the automated pipeline and doesn't change automated-pipeline monetization status at all.
 

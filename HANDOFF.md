@@ -1,8 +1,8 @@
 # deal-bot — Project Handoff
 
-Last updated: 2026-08-21 — refactored the single-file `deal_bot.py` into a
-`deal_bot/` package and swapped the AI model lineup (Qwen spec extraction,
-Nemotron caption fallback) since the previous update.
+Last updated: 2026-08-21 — added the build-first reliability trio (shared
+retry/backoff transport, watchdog heartbeat, phased pipeline with batched AI)
+since the previous update; test suite is now 171 stdlib tests.
 
 See also `VoltDrop_Project_Scope.md` in this repo for a narrative,
 higher-level overview of the same project — this document stays the deep
@@ -21,8 +21,9 @@ no local process to keep alive.
 **Entry point**: `python -m deal_bot` (the `deal_bot/` package; `__main__.py`
 delegates to `deal_bot/pipeline.py:main`). There is no top-level `deal_bot.py`
 anymore — a module file of that name would shadow the package on import.
-Package layout: `config.py` (env/constants), `sources/`, `storage/`,
-`integrations/`, `ai/`, and `pipeline.py` (the orchestrator).
+Package layout: `config.py` (env/constants), `transport.py` (shared
+retry/backoff HTTP seam), `sources/`, `storage/`, `integrations/`, `ai/`,
+`pipeline.py` (the orchestrator), `weekly_digest.py`, and `watchdog.py`.
 
 The now-deleted files from earlier iterations are superseded:
 - `deal_bot.py` — the original monolith; split into the `deal_bot/` package.
@@ -30,19 +31,51 @@ The now-deleted files from earlier iterations are superseded:
 
 ## How it runs
 
-- **Scheduler**: GitHub Actions, `.github/workflows/deal_bot.yml`, cron
-  `0 */4 * * *` (every 4 hours) plus `workflow_dispatch` for manual runs.
-  GitHub does not guarantee exact schedule timing — delays of tens of
-  minutes are normal. One run was observed to be silently skipped
-  entirely (not just delayed) with no clear root cause found (no GitHub
-  incident, repo/billing looked fine); worth watching if it recurs.
-- **Keepalive**: `.github/workflows/keepalive.yml` runs monthly and pushes
-  an empty commit. This exists because GitHub auto-disables a workflow's
-  `schedule` trigger after 60 days of *no git commit activity* on the repo
-  (workflow runs themselves don't count) — this keeps that from ever
-  silently lapsing. No manual attention needed.
-- **State**: 100% in Supabase (Postgres), nothing on local disk — required
-  because GitHub Actions runners are ephemeral (fresh filesystem every run).
+Three GitHub Actions workflows, all unattended:
+
+- **`deal-bot`** (`.github/workflows/deal_bot.yml`): cron `0 */4 * * *` (every
+  4 hours) plus `workflow_dispatch`. The main pipeline. GitHub does not
+  guarantee exact schedule timing — delays of tens of minutes are normal.
+- **`weekly-digest`** (`.github/workflows/weekly_digest.yml`): cron
+  `0 12 * * 1` (Mondays at noon UTC) plus `workflow_dispatch` (with a
+  `no_bluesky` boolean input for E2E testing). Runs `deal_bot.weekly_digest`.
+- **`watchdog`** (`.github/workflows/watchdog.yml`): cron `0 * * * *`
+  (every hour) plus `workflow_dispatch`. Dead-man's switch — see below.
+- **`keepalive`** (`.github/workflows/keepalive.yml`): monthly empty commit to
+  keep the schedule triggers from auto-disabling after 60 days of no commit
+  activity. No manual attention needed.
+
+**The posting pipeline** (`pipeline._process_deals`) is structured in explicit
+phases (deterministic filter → batched AI enrichment → post loop → post-loop
+reports) via a testable `_skip_reason` predicate, and spec extraction +
+analysis run as ONE batched OpenRouter call per phase. This phase split is what
+enables promoting the shadow classifier/scorer to real gates later.
+
+**State**: 100% in Supabase (Postgres), nothing on local disk — required
+because GitHub Actions runners are ephemeral (fresh filesystem every run).
+
+## Reliability infrastructure (retry transport + watchdog)
+
+- **`deal_bot/transport.py`** is the single HTTP seam for every outbound call
+  (OpenRouter client, all Supabase storage, `run_log`, the weekly digest, and
+  the watchdog). `transport.request(method, url, ...)` retries network errors
+  and `{408,425,429,500,502,503,504}` with bounded backoff (default 3 attempts,
+  ~1s, ~2s), honors `Retry-After` on 429 **capped at `MAX_SLEEP_SECONDS` (30)**,
+  and never retries permanent 4xx. Callers use `from deal_bot import transport`
+  + `transport.request(...)` (module-attribute access so tests can patch
+  `deal_bot.transport.request`).
+- **`load_seen` returns `dict | None`** — `None` on a hard fetch failure.
+  `run_once()` treats that as fatal: it logs a clear `run_log` error and bails
+  BEFORE fetching feeds, rather than running on an empty seen map (which would
+  risk double-posting). `{}` still means "no Supabase config / nothing seen".
+- **`deal_bot/watchdog.py` + hourly workflow** — the dead-man's switch. Every
+  run writes a `run_log` row; the watchdog queries the most recent `ran_at` and
+  posts a warning embed to `RUN_LOG_WEBHOOK_URL` if none lands within
+  `max_hours` (default 6 = 2× the 4h cadence). This covers a **silently-skipped
+  run** (already observed once pre-watchdog) or a crash before `log_run` — the
+  failure the bot can't self-report. Exits 0 whether or not it alerts.
+- **`log_run`** also routes through the transport, so a transient Supabase blip
+  at log time doesn't silently drop the heartbeat row.
 
 ## Supabase
 
@@ -75,12 +108,13 @@ handed to the user as SQL to run in Supabase's SQL editor.
   (`id` text pk, `source`, `title`, `url`, `sale_price`, `list_price`,
   `posted_at` timestamptz default `now()`), written by
   `record_posted_deal()` after each successful post. Backs the weekly
-  digest (`weekly_digest.py`). **Not yet created** — the `CREATE TABLE`
-  statement lives in `deal_bot/weekly_digest.py`; run it in the SQL editor
-  before the weekly digest has anything to read. Until then
-  `record_posted_deal()` fails silently (404 → print) and the digest skips.
+  digest (`weekly_digest.py`). **Created** in the Supabase SQL editor; the
+  `CREATE TABLE` statement also lives in `deal_bot/weekly_digest.py`.
+  Pruned on each weekly-digest run (`prune_posted_deals`, 90-day TTL). If
+  the table is missing, `record_posted_deal` fails silent but the digest's
+  fetch treats the missing table as a hard failure (non-zero exit).
 
-## Discord channels (7 webhooks, plus 2 optional shadow channels)
+## Discord channels (7 core webhooks + 3 shadow-mode webhooks)
 
 All currently point at **dev/test channels**, not production, on purpose —
 decision was to validate everything there first, then flip those channels'
@@ -98,8 +132,8 @@ setting change, not a code change.
 | `RUN_LOG_WEBHOOK_URL` | Status embed **every** run, success or failure — the main "is it actually working" channel to check |
 | `PRIVATE_WEBHOOK_URL` | Mirrors every posted deal as an embed + AI-written copy-paste caption (for manual X posting). This is the user's original pre-existing private channel, reused. |
 | `SHADOW_CLASSIFIER_WEBHOOK_URL` | Reports the desirability classifier's KEEP/DROP judgments — observation only, doesn't affect real posting (see below) |
-| `SHADOW_QUALITY_SCORER_WEBHOOK_URL` | Reports the deal quality scorer's 1-10 ratings — observation only (not yet created; feature stays off until set) |
-| `SHADOW_CATEGORIZER_WEBHOOK_URL` | Reports the category tagger's per-deal classification — observation only (not yet created; feature stays off until set) |
+| `SHADOW_QUALITY_SCORER_WEBHOOK_URL` | Reports the deal quality scorer's 1-10 ratings — observation only, doesn't gate posting (set as a repo secret) |
+| `SHADOW_CATEGORIZER_WEBHOOK_URL` | Reports the category tagger's per-deal classification — observation only, doesn't gate or route (set as a repo secret) |
 
 ## Bluesky
 
@@ -137,10 +171,15 @@ need topping up at this design's usage level (cheap models, batching,
 free-tier fallback).
 
 - `OPENROUTER_API_KEY` — secret.
-- `OPENROUTER_PRIMARY_MODEL` — variable, currently `deepseek/deepseek-v4-flash-0731` (paid, very cheap: $0.09/M prompt, $0.18/M completion tokens).
-- `OPENROUTER_FALLBACK_MODEL` — variable, currently `nvidia/nemotron-3-ultra-550b-a55b:free` (caption/classifier free fallback).
+- `OPENROUTER_PRIMARY_MODEL` — variable, currently `deepseek/deepseek-v4-flash-0731` (paid, very cheap: $0.09/M prompt, $0.18/M completion tokens). Used for caption verdicts, the deal analyst, and the desirability classifier.
+- `OPENROUTER_FALLBACK_MODEL` — variable, currently `nvidia/nemotron-3-ultra-550b-a55b:free` (caption/classifier/analyst free fallback).
 - `OPENROUTER_SPEC_EXTRACTION_MODEL` — variable, currently `qwen/qwen3.7-flash` ($0.03/$0.13 per M).
 - `OPENROUTER_SPEC_FALLBACK_MODEL` — variable, currently `google/gemini-2.5-flash-lite` (spec-extraction fallback, only called when the primary fails).
+- `OPENROUTER_QUALITY_SCORER_MODEL` / `OPENROUTER_QUALITY_SCORER_FALLBACK_MODEL` — variables, `google/gemma-4-26b-a4b-it:free` and the paid `google/gemma-4-26b-a4b-it`. Used by the deal quality scorer.
+- `OPENROUTER_CATEGORIZER_MODEL` / `OPENROUTER_CATEGORIZER_FALLBACK_MODEL` — same Gemma pair, used by the category tagger.
+- `OPENROUTER_WEEKLY_DIGEST_MODEL` / `OPENROUTER_WEEKLY_DIGEST_FALLBACK_MODEL` — same Gemma pair, used by the weekly digest.
+
+All of the above are Config Variables, not Secrets (see the Config reference below).
 - **Reasoning-effort handling is model-specific, not a fixed rule** — this
   mattered in practice three separate times (see "Bugs fixed"). The
   caption/classifier models need `reasoning: {"effort": "low"}` explicitly
@@ -204,19 +243,24 @@ differentiator worth keeping. `_hashtags_look_reasonable()` is a light
 sanity check (≤4 tags, well-formed), not an allow-list. If this comes up
 again, that's a considered decision, not an oversight.
 
-**Spec extraction (2026-08-16):** `extract_clean_specs()` turns a messy
-retail title (e.g. `"Crucial P3 Plus 2TB PCIe Gen4 3D NAND NVMe M.2 SSD,
-up to 5000MB/s - CT2000P3PSSD8"`) into a clean product name plus 0-4 short
-technical specs, feeding both the Discord embed (a "Specs" field) and the
-caption prompt above. **Woot/Best Buy only** — Steam titles are already
-clean and don't have hardware specs to extract; gated on
+**Spec extraction (2026-08-16, batched since 2026-08-21):**
+`extract_clean_specs()` turns a messy retail title (e.g. `"Crucial P3 Plus 2TB
+PCIe Gen4 3D NAND NVMe M.2 SSD, up to 5000MB/s - CT2000P3PSSD8"`) into a clean
+product name plus 0-4 short technical specs, feeding both the Discord embed
+(a "Specs" field) and the caption prompt above. **Woot/Best Buy only** — Steam
+titles are already clean and don't have hardware specs to extract; gated on
 `deal["source"] != "Steam"` in `_process_deals()`. Deliberately validates
 0-4 specs, not a forced minimum — a genuinely low-info title should get an
-honest empty list, not an invented one; confirmed in testing the model
-does this correctly on its own (a generic HDMI cable title correctly came
-back with `"specs": []`). Fails open per-field: an overlong title falls
-back to the raw title independently of whether the specs in the same
-response were otherwise valid, and vice versa.
+honest empty list, not an invented one. Fails open per-field: an overlong
+title falls back to the raw title independently of whether the specs in the
+same response were otherwise valid, and vice versa.
+
+Inside the phased pipeline it runs via **`extract_clean_specs_batch(titles)`** —
+ONE batched OpenRouter call for all candidates instead of N per-deal calls —
+with per-item validation identical to the per-deal function. If the batch
+doesn't parse to a clean per-item list (wrong count, wrong shape), it falls
+back to the per-deal `extract_clean_specs()` so a degraded batch is never worse
+than the previous behavior. The per-deal version is kept for direct use/tests.
 
 **Desirability classifier (SHADOW MODE ONLY, not gating
 anything yet):** `classify_desirable_deals()` — one batched call per run,
@@ -229,10 +273,10 @@ models fail, since a wrong DROP would be invisible (a good deal silently
 never posted) while a wrong KEEP is just a visible, ignorable post.
 
 The plan: watch the shadow channel against real deals over time, and only
-promote this to an actual gate once its judgment is trusted. Turning it
-into a real gate requires restructuring `_process_deals()`'s loop into two
-phases (collect candidates → one batched classify call → post the KEEPs) —
-not yet done, since shadow mode doesn't need that restructuring.
+promote this to an actual gate once its judgment is trusted. The prerequisite
+restructure — turning `_process_deals()`'s loop into explicit phases so AI
+judgment runs before posting — is **done** (the phased pipeline), so promotion
+is now purely gated on reviewing enough shadow data (see BACKLOG.md §3).
 
 Reasoning-effort quality tradeoff is only lightly validated: tested on
 deliberately obvious cases (RTX 4070 Ti / Elden Ring / gaming mouse vs.
@@ -256,15 +300,20 @@ Secrets-vs-Variables note below for why that distinction was deliberate.
 
 Real credentials → **Secrets** (write-only, correct for anything
 sensitive): `WOOT_API_KEY`, `BESTBUY_API_KEY`, `SUPABASE_URL`,
-`SUPABASE_SERVICE_KEY`, all 7 Discord webhook URLs, `BLUESKY_HANDLE`,
+`SUPABASE_SERVICE_KEY`, all 10 Discord webhook URLs (7 core + 3 shadow),
+`BLUESKY_HANDLE`,
 `BLUESKY_APP_PASSWORD`, `OPENROUTER_API_KEY`.
 
 Plain tuning config → **Variables** (visible/editable later, correctly
 *not* secret): `MIN_DISCOUNT_PERCENT`, `MIN_DOLLAR_SAVINGS`,
 `BLUESKY_MIN_DISCOUNT_PERCENT`, `BLUESKY_MAX_POSTS_PER_RUN`,
 `PRICE_HISTORY_MIN_DAYS`, `PRICE_HISTORY_TOLERANCE_PERCENT`,
-`OPENROUTER_PRIMARY_MODEL`, `OPENROUTER_FALLBACK_MODEL`,
-`OPENROUTER_SPEC_EXTRACTION_MODEL`.
+`MIN_QUALITY_SCORE`, and the model-name overrides
+(`OPENROUTER_PRIMARY_MODEL`, `OPENROUTER_FALLBACK_MODEL`,
+`OPENROUTER_SPEC_EXTRACTION_MODEL`, `OPENROUTER_SPEC_FALLBACK_MODEL`,
+`OPENROUTER_QUALITY_SCORER_MODEL`, `OPENROUTER_QUALITY_SCORER_FALLBACK_MODEL`,
+`OPENROUTER_CATEGORIZER_MODEL`, `OPENROUTER_CATEGORIZER_FALLBACK_MODEL`,
+`OPENROUTER_WEEKLY_DIGEST_MODEL`, `OPENROUTER_WEEKLY_DIGEST_FALLBACK_MODEL`).
 
 These were **originally all put in Secrets** (including the tuning
 numbers), which was wrong — Secrets can never be viewed again after
@@ -277,28 +326,38 @@ Local `.env` (gitignored, never committed — verified multiple times via
 runs. `.env.example` is the committed, values-blank template — keep it in
 sync when adding new config.
 
-## Testing (added 2026-08-16)
+## Testing (added 2026-08-16, grown since)
 
 Before this, the project had zero automated tests — every feature was
-verified via live, real API calls during development instead (a
-deliberate practice throughout, not a gap; kept doing this alongside the
-new tests, not instead of them). Now there's a stdlib `unittest` suite,
-no new dependency:
+verified via live, real API calls during development instead (a deliberate
+practice throughout, not a gap; kept doing this alongside the new tests, not
+instead of them). Now there's a stdlib `unittest` suite, no new dependency:
 
-- `tests/test_spec_extraction.py` — 13 tests.
-- `tests/test_deal_verdict.py` — 11 tests.
-- **24 tests total**, run via `python -m unittest discover -s tests -p
-  "test_*.py"` (or `pytest tests/` if pytest happens to be installed
-  locally — it isn't by default, and isn't a project dependency).
-- Wired into `.github/workflows/deal_bot.yml` as a step named "Run Unit
-  Tests," ahead of the actual bot execution. The bot-run step has
-  `if: always()` so a test failure shows up clearly (red step in the
-  Actions log) but can **never silently block the scheduled run** — this
-  matters a lot for something meant to run unattended; a broken test
-  silently preventing all deal-finding for days, with the only symptom
-  being an absence of activity, is exactly the failure mode
-  `run_log`/`RUN_LOG_WEBHOOK_URL` already exist to prevent elsewhere in
-  this project.
+- `tests/test_spec_extraction.py` — spec extraction (per-deal + the batched
+  path), and via the real `_process_deals` code path the Steam-skip logic.
+- `tests/test_deal_verdict.py` — caption "verdict" prompt context + fallbacks.
+- `tests/test_amazon_vetting.py` — the standalone Amazon vetting tool.
+- `tests/test_deal_scorer.py` / `tests/test_categorizer.py` — shadow AI
+  features' parse + fail-open behavior.
+- `tests/test_deal_analyst.py` / `tests/test_weekly_digest.py` — the analyst
+  and the weekly digest (bulk fetch/prune/seed/clear, retry behavior, dry-run,
+  exit codes).
+- `tests/test_pipeline.py` — the phased pipeline: `_skip_reason` boundaries,
+  `run_once`'s `load_seen`-None bail, batch spec/analysis fallbacks.
+- `tests/test_watchdog.py` — the dead-man's switch: freshness, staleness,
+  ordering of the `run_log` query.
+
+**171 tests total**, run via `python -m unittest discover -s tests -p
+"test_*.py"` (or `pytest tests/` if pytest happens to be installed locally —
+it isn't by default, and isn't a project dependency).
+
+Wired into `.github/workflows/deal_bot.yml` as a step named "Run Unit Tests,"
+ahead of the actual bot execution. The bot-run step has `if: always()` so a
+test failure shows up clearly (red step in the Actions log) but can **never
+silently block the scheduled run** — this matters a lot for something meant to
+run unattended; a broken test silently preventing all deal-finding for days,
+with the only symptom being an absence of activity, is exactly the failure mode
+`run_log`/`RUN_LOG_WEBHOOK_URL` (and now the watchdog) exist to prevent.
 
 ## Bugs found and fixed this session (context for future debugging)
 
@@ -351,6 +410,23 @@ no new dependency:
    600 `max_tokens`) or it would cut off mid-sentence. Confirmed reliable
    across 9 repeated real-API test calls after the fix, with no
    hallucinated specs in any of them.
+10. **PostgREST rejects an unbounded DELETE (2026-08-21)** — the weekly
+    digest's `--clear` initially did `DELETE` with no WHERE clause and got
+    HTTP 400. Fixed by scoping to seed rows only (`id` `like 'seed:%'`),
+    so testing cleanup can never wipe the whole `posted_deals` table.
+11. **`load_seen` no-op-on-failure was a silent double-post risk
+    (2026-08-21)** — a transient Supabase failure returned `{}`, so the run
+    treated every deal as new. `load_seen` now returns `None` on a hard
+    failure and `run_once` bails with a logged error before fetching feeds.
+12. **A test's broken config restore cascaded into later modules
+    (2026-08-21)** — a `SkipReasonTests` tearDown referenced attributes
+    never saved by setUp, raising in tearDown and leaving mutated
+    thresholds that leaked into subsequent test files. Fixed by saving all
+    four thresholds and pinning a deterministic baseline per test.
+13. **The free-tier Gemma models intermittently 429** (observed
+    2026-08-21) — the designated recovery is the paid
+    `google/gemma-4-26b-a4b-it` fallback, wired as the fallback model in
+    every Gemma-based feature.
 
 ## Design principles established (worth preserving)
 
@@ -381,27 +457,25 @@ no new dependency:
 
 ## Open items / next steps
 
-- **Best Buy API key** — still pending approval as of last check (applied
-  ~5+ days prior). Once it arrives: set `BESTBUY_API_KEY`, and specifically
-  double-check bug #1 above (the query-encoding issue) since it's never
-  been exercised against a real key.
-- **Shadow classifier** — needs more real-world runs before deciding
-  whether to promote it to an actual gate. Also worth testing reasoning
-  effort (`low` vs `medium`) specifically on ambiguous/borderline items
-  before trusting it on those.
-- **Scheduled-run reliability** — one 00:00 UTC anchor was silently
-  skipped by GitHub with no root cause found; a one-time check was
-  scheduled for the following anchor via `mcp__scheduled-tasks` but its
-  outcome isn't confirmed in this conversation — worth checking recent
-  `gh run list` history for a pattern.
+- **Best Buy API key** — still pending approval as of last check. Once it
+  arrives: set `BESTBUY_API_KEY`, and specifically double-check bug #1 above
+  (the query-encoding issue) since it's never been exercised against a real
+  key.
+- **Shadow-feature promotion** — the classifier/scorer/categorizer are shadow
+  mode until enough real-world runs are reviewed (the pipeline's phase split
+  that promotion needs is already done). See BACKLOG.md §3.
+- **Webhook false-negative dedupe gap** — if a Discord webhook call actually
+  succeeds server-side but the HTTP response is lost before the code sees it,
+  `seen_deals` never gets updated for that deal, and since state persists
+  across runs, it could look "never posted" on a *future* run and genuinely
+  post twice. Rare (needs a network failure at exactly the wrong moment), real,
+  not fixed.
+- **`price_history` growth / `load_seen` pagination** — `price_history` grows a
+  row per deal per day forever, and `load_seen` doesn't page past PostgREST's
+  ~1000-row cap. Fine at current volume with TTL pruning, but worth revisiting
+  before Best Buy more than doubles deal count.
 - **Dev → prod channel flip** — whenever ready, this is a Discord privacy
   setting change on the existing channels, not a code change.
-- **Webhook false-negative dedupe gap** — if a Discord webhook call
-  actually succeeds server-side but the HTTP response is lost before the
-  code sees it, `seen_deals` never gets updated for that deal, and since
-  state persists across runs, it could look "never posted" on a *future*
-  run and genuinely post twice. Rare (needs a network failure at exactly
-  the wrong moment), real, not fixed.
 - Old `price_history` rows retain `observed_date = NULL` (pre-dates the
   schema fix) — harmless, a real backfill would need to also collapse the
   historical duplicate rows first, deliberately not done.
@@ -409,8 +483,20 @@ no new dependency:
 ## Useful commands
 
 ```bash
-# Manually trigger a run
+# Run the test suite
+python -m unittest discover -s tests -p "test_*.py"
+# or one module: python -m unittest tests.test_pipeline -v
+
+# Manually trigger a run / the weekly digest / the watchdog
 gh workflow run deal_bot.yml --repo jmocera/discord-deal-finder
+gh workflow run weekly_digest.yml --repo jmocera/discord-deal-finder -f no_bluesky=true   # E2E: skip Bluesky
+gh workflow run watchdog.yml --repo jmocera/discord-deal-finder
+
+# Weekly digest CLI (local E2E), see deal_bot/weekly_digest.py --help
+python -m deal_bot.weekly_digest --dry-run    # fetch + build, post nothing
+python -m deal_bot.weekly_digest --seed 7     # insert fake rows (then --clear)
+python -m deal_bot.weekly_digest --clear
+python -m deal_bot.watchdog                   # watchdog CLI: --max-hours N
 
 # Recent run history
 gh run list --repo jmocera/discord-deal-finder --workflow=deal_bot.yml --limit 10

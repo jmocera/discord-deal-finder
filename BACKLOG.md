@@ -20,15 +20,19 @@ Status legend: `done` / `in-progress` / `blocked` / `backlog`.
 ## 2. Shipped
 
 - **Structural refactor** — `deal_bot.py` monolith → `deal_bot/` package
-  (`config`, `sources/`, `storage/`, `integrations/`, `ai/`, `pipeline`,
-  `__main__`). Entry point `python -m deal_bot`. Commit `c71ad09`.
+  (`config`, `transport`, `sources/`, `storage/`, `integrations/`, `ai/`,
+  `pipeline`, `weekly_digest`, `watchdog`, `__main__`). Entry point
+  `python -m deal_bot`. Commit `c71ad09`.
 - **Model cost reduction** — spec extraction → `qwen/qwen3.7-flash` (~3x
   cheaper); caption/classifier fallback → `nvidia/nemotron-3-ultra-550b-a55b:free`.
 - **Deal analysis** (live) — `ai/deal_analyst.py`, "Analysis" field on Discord embeds.
 - **Deal quality scorer** (shadow) — `ai/deal_scorer.py`, 1-10 ratings.
 - **Category tagger** (shadow) — `ai/categorizer.py`, 6 categories.
 - **Weekly digest** — `weekly_digest.py` + `weekly_digest.yml`.
-- **119 stdlib tests**, all passing.
+- **Shared retry/backoff transport** — `deal_bot/transport.py`, the single HTTP seam with bounded retry + `Retry-After` cap (commit `29712fa`, review-hardened in `6720615`).
+- **Watchdog heartbeat** — `watchdog.py` + hourly `watchdog.yml` (dead-man's switch).
+- **Phased pipeline + batched AI** — `_process_deals` split into explicit phases with a testable `_skip_reason`; spec + analysis run one batched call per phase.
+- **171 stdlib tests**, all passing.
 
 ---
 
@@ -45,10 +49,11 @@ invisible lost deal).
   KEEP/DROP + 1-10 scores + categories look sane against actual deals.
 - **Rollout once trusted:** two-phase — (1) shadow-report continues while a
   dry-run gate simulates what would have been filtered, (2) promote to a real
-  gate.
-- **Engineering note:** promoting requires restructuring `_process_deals()` in
-  `pipeline.py` into two phases (collect candidates → one batched AI call →
-  post the survivors), which shadow mode deliberately avoids today.
+  gate by wiring the AI verdict into the deterministic-filter phase
+  (`_skip_reason` already runs before posting).
+- **Prerequisite shipped:** the phased `_process_deals()` that promotion needs
+  is done (candidates collected → batched AI → post), so this item is now
+  purely data-gated, not engineering-gated.
 - **Not yet promoted** — the category tagger has no consumer yet (see §8 channel
   routing), so it should probably stay shadow until routing lands.
 
