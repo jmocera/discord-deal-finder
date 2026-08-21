@@ -7,9 +7,8 @@ model-specific gotchas live in exactly one place.
 
 import re
 
-import requests
-
-from deal_bot import config
+from deal_bot import config, transport
+from deal_bot.transport import request as _request
 
 
 def _call_openrouter(
@@ -28,6 +27,10 @@ def _call_openrouter(
     their whole token budget on internal reasoning unless `effort` is set;
     others break if *any* effort is set. So every caller states explicitly
     what it needs rather than this function guessing for all models.
+
+    Transient failures (network blips, 429/5xx) are retried by the shared
+    transport; this still fails open (returns None) after that, so the
+    caller's fallback chain (next model / plain template) is unaffected.
     """
     if not config.OPENROUTER_API_KEY:
         return None
@@ -44,18 +47,17 @@ def _call_openrouter(
         payload["reasoning"] = reasoning
     if response_format is not None:
         payload["response_format"] = response_format
-    try:
-        resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=timeout,
-        )
-    except requests.RequestException as e:
-        print(f"[openrouter] request failed for model {model}: {e}")
+
+    headers = {
+        "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    resp = transport.request(
+        "POST", "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers, json=payload, timeout=timeout,
+    )
+    if resp is None:
+        print(f"[openrouter] request failed for model {model} after retries")
         return None
     if resp.status_code != 200:
         print(f"[openrouter] model {model} returned {resp.status_code}: {resp.text[:300]}")

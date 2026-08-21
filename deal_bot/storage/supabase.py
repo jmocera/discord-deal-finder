@@ -10,9 +10,7 @@ editor.
 
 from datetime import datetime, timedelta, timezone
 
-import requests
-
-from deal_bot import config
+from deal_bot import config, transport
 
 
 def _supabase_headers() -> dict:
@@ -23,23 +21,21 @@ def _supabase_headers() -> dict:
     }
 
 
-def load_seen() -> dict:
+def load_seen() -> dict | None:
+    """Load seen-deal dedupe state. Returns a dict on success, None on a hard
+    fetch failure (network exhausted or non-200), and {} only when there's no
+    Supabase config (skip). Callers treat None as fatal — running on an empty
+    seen map would treat every deal as new and risk double-posting."""
     if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_KEY:
         return {}
     url = f"{config.SUPABASE_URL}/rest/v1/seen_deals?select=id,source,last_seen,sale_price,lowest_price,lowest_price_date"
-    try:
-        # NOTE: PostgREST defaults to capping results (commonly 1000 rows)
-        # with no pagination handled here — fine at today's volume with
-        # SEEN_TTL_DAYS keeping the table bounded, but worth revisiting if
-        # this table grows a lot.
-        resp = requests.get(url, headers=_supabase_headers(), timeout=15)
-    except requests.RequestException as e:
-        print(f"[supabase] load failed: {e}")
-        return {}
-
+    resp = transport.request("GET", url, headers=_supabase_headers())
+    if resp is None:
+        print("[supabase] load failed after retries")
+        return None
     if resp.status_code != 200:
         print(f"[supabase] load returned {resp.status_code}: {resp.text[:300]}")
-        return {}
+        return None
 
     seen = {}
     for row in resp.json():
@@ -69,10 +65,9 @@ def upsert_seen_entry(deal_id: str, source: str, entry: dict) -> None:
         "lowest_price": entry["lowest_price"],
         "lowest_price_date": entry["lowest_price_date"],
     }
-    try:
-        resp = requests.post(url, headers=headers, json=[row], timeout=15)
-    except requests.RequestException as e:
-        print(f"[supabase] upsert failed for {deal_id}: {e}")
+    resp = transport.request("POST", url, headers=headers, json=[row])
+    if resp is None:
+        print(f"[supabase] upsert failed for {deal_id} after retries")
         return
     if resp.status_code not in (200, 201, 204):
         print(f"[supabase] upsert for {deal_id} returned {resp.status_code}: {resp.text[:300]}")
@@ -103,10 +98,9 @@ def record_posted_deal(deal: dict) -> None:
         "sale_price": deal["sale_price"],
         "list_price": deal["list_price"],
     }
-    try:
-        resp = requests.post(url, headers=headers, json=[row], timeout=15)
-    except requests.RequestException as e:
-        print(f"[supabase] posted_deals insert failed for {deal['id']}: {e}")
+    resp = transport.request("POST", url, headers=headers, json=[row])
+    if resp is None:
+        print(f"[supabase] posted_deals insert failed for {deal['id']} after retries")
         return
     if resp.status_code not in (200, 201, 204):
         print(f"[supabase] posted_deals insert for {deal['id']} returned {resp.status_code}: {resp.text[:300]}")
@@ -117,15 +111,9 @@ def prune_seen(ttl_days: int) -> None:
         return
     cutoff = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).isoformat()
     url = f"{config.SUPABASE_URL}/rest/v1/seen_deals"
-    try:
-        # Passed via params (not embedded in an f-string URL) so requests
-        # percent-encodes the "+00:00" offset instead of it being read as
-        # a literal space in the query string.
-        resp = requests.delete(
-            url, headers=_supabase_headers(), params={"last_seen": f"lt.{cutoff}"}, timeout=15
-        )
-    except requests.RequestException as e:
-        print(f"[supabase] prune failed: {e}")
+    resp = transport.request("DELETE", url, headers=_supabase_headers(), params={"last_seen": f"lt.{cutoff}"})
+    if resp is None:
+        print("[supabase] prune failed after retries")
         return
     if resp.status_code not in (200, 204):
         print(f"[supabase] prune returned {resp.status_code}: {resp.text[:300]}")

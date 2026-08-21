@@ -34,12 +34,9 @@ CLI (mostly for testing the digest end-to-end safely):
 
 import argparse
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 
-import requests
-
-from deal_bot import config
+from deal_bot import config, transport
 from deal_bot.ai.client import _call_openrouter
 from deal_bot.integrations.bluesky import post_text_to_bluesky
 from deal_bot.integrations.discord import build_weekly_digest_embed, _post_webhook
@@ -47,49 +44,15 @@ from deal_bot.storage.supabase import _supabase_headers
 
 _PRUNE_DAYS = 90  # posted_deals older than this are deleted each run
 
-# Status codes that warrant a retry (transient upstream/Supabase blips).
-_RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
-_MAX_ATTEMPTS = 3
-_BACKOFF_SECONDS = (1.0, 2.0)  # sleep between attempts 1->2, 2->3
 
-
-def _supabase_request(method: str, url: str, *, json=None, params=None, headers=None, timeout: int = 15) -> requests.Response | None:
-    """Issue a Supabase REST call with bounded retry on transient failures.
-
-    Retries network errors (RequestException) and retryable status codes
-    ({408, 425, 429, 500, 502, 503, 504}) with backoff, honoring
-    Retry-After on 429. Permanent 4xx responses (400/401/404) fail
-    immediately — they'd never succeed on retry. Returns the last Response,
-    or None only after exhausting all network-error retries."""
+def _supabase_request(method: str, url: str, *, json=None, params=None, headers=None, timeout: int = 15):
+    """Supabase request via the shared transport, merging the service-role
+    auth headers. Retry/backoff policy lives in deal_bot.transport (single
+    source of truth) — this is just the Supabase-specific header wrapper."""
     req_headers = _supabase_headers()
     if headers:
         req_headers.update(headers)
-    for attempt in range(1, _MAX_ATTEMPTS + 1):
-        try:
-            resp = requests.request(method, url, headers=req_headers, json=json, params=params, timeout=timeout)
-        except requests.RequestException as e:
-            if attempt == _MAX_ATTEMPTS:
-                return None
-            print(f"[weekly] {method} failed (attempt {attempt}/{_MAX_ATTEMPTS}): {e}")
-            time.sleep(_BACKOFF_SECONDS[attempt - 1])
-            continue
-
-        if resp.status_code not in _RETRYABLE_STATUSES:
-            return resp
-        if attempt == _MAX_ATTEMPTS:
-            return resp
-
-        wait = _BACKOFF_SECONDS[attempt - 1]
-        if resp.status_code == 429:
-            retry_after = resp.headers.get("Retry-After")
-            if retry_after:
-                try:
-                    wait = max(wait, float(retry_after))
-                except ValueError:
-                    pass
-        print(f"[weekly] {method} returned {resp.status_code} (attempt {attempt}/{_MAX_ATTEMPTS}), retrying in {wait:.1f}s")
-        time.sleep(wait)
-    return None
+    return transport.request(method, url, headers=req_headers, json=json, params=params, timeout=timeout)
 
 
 def fetch_recent_posted(days: int = 7, limit: int | None = None) -> list[dict] | None:

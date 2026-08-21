@@ -1,0 +1,31 @@
+name: watchdog
+
+# Dead-man's switch for the unattended deal bot. The bot writes a run_log row
+# every scheduled run; if no row lands within MAX_HOURS (default 6 = 2x the
+# 4-hourly cadence), a warning embed is posted to the run-log Discord channel.
+# Catches runs that are silently skipped by the scheduler or that crash before
+# logging — the one failure the bot cannot report itself.
+"on":
+  schedule:
+    - cron: "0 * * * *"  # every hour at minute 0
+  workflow_dispatch: {}
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run watchdog
+        run: python -m deal_bot.watchdog
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          RUN_LOG_WEBHOOK_URL: ${{ secrets.RUN_LOG_WEBHOOK_URL }}

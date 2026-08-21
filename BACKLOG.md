@@ -104,16 +104,33 @@ invisible lost deal).
 
 ## 7. Reliability
 
-**Status:** backlog · **Owner:** user
+**Status:** in-progress · **Owner:** user
 
+- **Shared retry/backoff transport** — done: `deal_bot/transport.py` is the
+  single seam for every outbound HTTP call (OpenRouter client, all Supabase
+  storage, run_log, weekly digest, watchdog). Bounded retries on network
+  errors + `{408,425,429,500,502,503,504}`, honors Retry-After, no retry on
+  permanent 4xx. Closes the double-post risk from a transient `load_seen`
+  failure (which now returns `None` — `run_once` bails and logs rather than
+  running on an empty seen map).
+- **Watchdog heartbeat (dead-man's switch)** — done: `deal_bot/watchdog.py` +
+  `.github/workflows/watchdog.yml` (hourly). Alerts if no `run_log` row lands
+  within `max_hours` (default 6 = 2x the 4h cadence), covering the silently-
+  skipped-run failure the bot can't self-report. Live-verified: fresh run →
+  no alert.
+- **Two-phase pipeline + batched AI enrichment** — done: `_process_deals` is
+  now explicit phases (deterministic filter via testable `_skip_reason` →
+  batched spec+analysis → post loop → bluesky/digest/shadow reports), and
+  spec extraction + analysis run as ONE batched call per phase instead of
+  N sequential calls (with per-item fallback to the old per-deal path on a
+  degraded batch). This is the enabling restructure for gate promotion.
 - **Webhook false-negative dedupe gap** — if a Discord webhook call succeeds
   server-side but the HTTP response is lost, `seen_deals` never updates and the
   deal could post twice on a later run. Rare, real, not fixed (documented in
   HANDOFF's bug list).
-- **One silently-skipped scheduled run** — a single GitHub schedule run was
-  skipped with no root cause. Watch for a pattern, not a one-off.
-- **Per-run AI latency** — the 2-model spec-extraction chain adds worst-case
-  latency per deal; bounded today, worth a per-run budget if volume climbs.
+- **One silently-skipped scheduled run** — now surfaced by the watchdog rather
+  than left to "absence of activity"; root cause still unknown but the failure
+  is no longer silent.
 
 ---
 

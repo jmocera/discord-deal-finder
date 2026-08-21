@@ -335,33 +335,35 @@ class OpenRouterCallTests(unittest.TestCase):
 
     def test_missing_api_key_skips_network_call(self):
         config.OPENROUTER_API_KEY = ""
-        with patch("deal_bot.ai.client.requests.post") as mock_post:
+        with patch("deal_bot.transport.request") as mock_post:
             result = vet._call_openrouter("some-model", "system", "user")
             mock_post.assert_not_called()
         self.assertIsNone(result)
 
-    @patch("deal_bot.ai.client.requests.post")
-    def test_network_timeout_returns_none(self, mock_post):
-        mock_post.side_effect = vet.requests.exceptions.Timeout("timed out")
+    @patch("deal_bot.transport.request")
+    def test_network_failure_returns_none(self, mock_request):
+        # transport.request returns None only after exhausting network retries
+        # — the client's fail-open path for a hard network failure.
+        mock_request.return_value = None
         self.assertIsNone(vet._call_openrouter("some-model", "system", "user"))
 
-    @patch("deal_bot.ai.client.requests.post")
+    @patch("deal_bot.transport.request")
     def test_http_500_returns_none(self, mock_post):
         mock_post.return_value = _mock_response(500, text="internal server error")
         self.assertIsNone(vet._call_openrouter("some-model", "system", "user"))
 
-    @patch("deal_bot.ai.client.requests.post")
+    @patch("deal_bot.transport.request")
     def test_empty_content_returns_none(self, mock_post):
         mock_post.return_value = _openrouter_response("")
         self.assertIsNone(vet._call_openrouter("some-model", "system", "user"))
 
-    @patch("deal_bot.ai.client.requests.post")
+    @patch("deal_bot.transport.request")
     def test_code_fence_wrapped_json_is_stripped(self, mock_post):
         mock_post.return_value = _openrouter_response('```json\n{"a": 1}\n```')
         result = vet._call_openrouter("some-model", "system", "user")
         self.assertEqual(result, '{"a": 1}')
 
-    @patch("deal_bot.ai.client.requests.post")
+    @patch("deal_bot.transport.request")
     def test_list_user_content_accepted_for_vision(self, mock_post):
         mock_post.return_value = _openrouter_response('{"ok": true}')
         content_blocks = [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}]
@@ -382,7 +384,7 @@ class VetFromTextTests(unittest.TestCase):
     def tearDown(self):
         config.OPENROUTER_API_KEY = self._orig_key
 
-    @patch("deal_bot.ai.client.requests.post")
+    @patch("deal_bot.transport.request")
     def test_full_pipeline_with_url_produces_canonical_link_and_risk(self, mock_post):
         mock_post.return_value = _openrouter_response(json.dumps({
             "clean_title": "Crucial P3 Plus 2TB NVMe SSD", "sale_price": 79.99,
@@ -394,7 +396,7 @@ class VetFromTextTests(unittest.TestCase):
         self.assertEqual(result["canonical_url"], "https://www.amazon.com/dp/B08N5WRWNW?tag=voltdrop05-20")
         self.assertTrue(result["risk_assessment"]["passed"])
 
-    @patch("deal_bot.ai.client.requests.post")
+    @patch("deal_bot.transport.request")
     def test_no_source_url_means_no_canonical_link(self, mock_post):
         mock_post.return_value = _openrouter_response(json.dumps({
             "clean_title": "Some Product", "sale_price": 10.0, "list_or_typical_price": None,
@@ -404,9 +406,12 @@ class VetFromTextTests(unittest.TestCase):
         self.assertIsNone(result["asin"])
         self.assertIsNone(result["canonical_url"])
 
-    @patch("deal_bot.ai.client.requests.post")
-    def test_openrouter_failure_still_returns_a_full_shape_with_risk_assessment(self, mock_post):
-        mock_post.side_effect = vet.requests.exceptions.Timeout("timed out")
+    @patch("deal_bot.transport.request")
+    def test_openrouter_failure_still_returns_a_full_shape_with_risk_assessment(self, mock_request):
+        # transport.request returns None only after exhausting network retries
+        # — the client's fail-open path, which must still yield a full vetted
+        # shape with a risk assessment rather than raising.
+        mock_request.return_value = None
         result = vet.vet_from_text("pasted page text", source_url="https://www.amazon.com/dp/B08N5WRWNW")
         self.assertIsNone(result["clean_title"])
         self.assertIn("risk_assessment", result)
@@ -421,7 +426,7 @@ class VetFromImageTests(unittest.TestCase):
     def tearDown(self):
         config.OPENROUTER_API_KEY = self._orig_key
 
-    @patch("deal_bot.ai.client.requests.post")
+    @patch("deal_bot.transport.request")
     def test_full_pipeline_reads_and_encodes_real_file(self, mock_post):
         mock_post.return_value = _openrouter_response(json.dumps({
             "clean_title": "Crucial P3 Plus 2TB NVMe SSD", "sale_price": 79.99,
@@ -439,14 +444,14 @@ class VetFromImageTests(unittest.TestCase):
         self.assertTrue(any(block.get("type") == "image_url" for block in sent_content))
 
     def test_missing_file_falls_back_without_calling_openrouter(self):
-        with patch("deal_bot.ai.client.requests.post") as mock_post:
+        with patch("deal_bot.transport.request") as mock_post:
             result = vet.vet_from_image("does/not/exist.png")
             mock_post.assert_not_called()
         self.assertEqual(result["clean_title"], vet._EMPTY_FIELDS["clean_title"])
 
     def test_oversized_image_falls_back_without_calling_openrouter(self):
         with patch("pathlib.Path.read_bytes", return_value=b"0" * (vet._MAX_IMAGE_BYTES + 1)), \
-             patch("deal_bot.ai.client.requests.post") as mock_post:
+             patch("deal_bot.transport.request") as mock_post:
             result = vet.vet_from_image("huge.png")
             mock_post.assert_not_called()
         self.assertIsNone(result["clean_title"])
@@ -505,7 +510,7 @@ class RunUrlModeRoutingTests(unittest.TestCase):
 
     @patch("vet_amazon_deal.fetch_amazon_page_text", return_value=None)
     def test_failed_fetch_does_not_call_openrouter(self, mock_fetch):
-        with patch("deal_bot.ai.client.requests.post") as mock_post:
+        with patch("deal_bot.transport.request") as mock_post:
             vet.run_url_mode("https://www.amazon.com/dp/B08N5WRWNW")
             mock_post.assert_not_called()
 

@@ -6,12 +6,12 @@ from datetime import datetime, timezone
 
 import requests
 
-from deal_bot import config
+from deal_bot import config, transport
 from deal_bot.ai.categorizer import categorize_deals
 from deal_bot.ai.classifier import classify_desirable_deals
-from deal_bot.ai.deal_analyst import build_ai_analysis
+from deal_bot.ai.deal_analyst import build_ai_analysis_batch
 from deal_bot.ai.deal_scorer import score_deals
-from deal_bot.ai.spec_extraction import extract_clean_specs
+from deal_bot.ai.spec_extraction import extract_clean_specs_batch
 from deal_bot.integrations.bluesky import post_to_bluesky
 from deal_bot.integrations.discord import (
     build_categorizer_embed,
@@ -161,82 +161,89 @@ def run_once() -> None:
         )
 
 
+def _skip_reason(deal: dict, prior: dict | None, history_days: int, history_low: float | None) -> str | None:
+    """The deterministic pre-post filter, factored out so the gate decisions
+    are independently testable. Returns the stats key explaining WHY the deal
+    is skipped, or None when it should proceed to posting. Mirrors the
+    historical behavior exactly."""
+    if prior:
+        prior_price = prior.get("sale_price")
+        if prior_price is None:
+            return "skipped_already_seen"
+        if deal["sale_price"] >= prior_price - config.MIN_DOLLAR_SAVINGS:
+            return "skipped_no_better_price"
+    if deal["discount_pct"] is None or deal["discount_pct"] < config.MIN_DISCOUNT_PERCENT:
+        return "skipped_below_threshold"
+    if deal["list_price"] and (deal["list_price"] - deal["sale_price"]) < config.MIN_DOLLAR_SAVINGS:
+        return "skipped_below_threshold"
+    # Price-history quality gate: once there's enough real history for this
+    # exact item, require the sale price to be near its own recorded floor,
+    # not just far from the retailer's list price. Dormant until enough days.
+    if history_days >= config.PRICE_HISTORY_MIN_DAYS and history_low is not None:
+        ceiling = history_low * (1 + config.PRICE_HISTORY_TOLERANCE_PERCENT / 100)
+        if deal["sale_price"] > ceiling:
+            return "skipped_not_near_historical_low"
+    return None
+
+
 def _process_deals(
     all_deals: list[dict], seen: dict, digest_stats: dict, stats: dict, history_map: dict
 ) -> None:
-    """The main posting loop, split out so run_once() can wrap it in a
-    single try/except for log_run without one giant indented block.
-    Mutates `stats` (new_count, skipped_*, digest_sent) in place rather
-    than returning at the end — see the comment in run_once()."""
-    bluesky_candidates = []  # collected here, ranked and capped after the loop
-    posted_deals = []  # every deal that actually posted this run — for the shadow classifier report
+    """Posting pipeline, structured in explicit phases so AI judgment runs
+    BEFORE posting (enabling gate promotion later) while remaining
+    behavior-neutral today — shadow features still don't gate anything.
 
+    Phase A) deterministic filter -> candidates; B) batched AI enrichment
+    (spec + analysis); C) post loop; D) capped Bluesky + digest + shadow
+    reports. Mutates `stats` in place rather than returning at the end —
+    run_once() depends on that for crash-accurate run_log counts."""
+    bluesky_candidates = []  # collected here, ranked and capped after the loop
+    posted_deals = []  # every deal that actually posted — for the shadow reports
+
+    # ---- PHASE A — deterministic filter into a candidate list -------------
+    candidates = []
     for deal in all_deals:
         prior = seen.get(deal["id"])
-        if prior:
-            prior_price = prior.get("sale_price")
-            if prior_price is None:
-                stats["skipped_already_seen"] += 1
-                continue
-            if deal["sale_price"] >= prior_price - config.MIN_DOLLAR_SAVINGS:
-                stats["skipped_no_better_price"] += 1
-                continue
-        if deal["discount_pct"] is None or deal["discount_pct"] < config.MIN_DISCOUNT_PERCENT:
-            stats["skipped_below_threshold"] += 1
-            continue
-        if deal["list_price"] and (deal["list_price"] - deal["sale_price"]) < config.MIN_DOLLAR_SAVINGS:
-            stats["skipped_below_threshold"] += 1
-            continue
-
-        # Price-history quality gate. Discount off the retailer's listed
-        # price is a weak signal on its own (list prices get inflated) —
-        # once there's enough real history for this exact item, require
-        # the sale price to actually be near its own recorded floor, not
-        # just far from a number the retailer picked. Dormant until
-        # PRICE_HISTORY_MIN_DAYS of distinct-day history exists for a
-        # given deal_id. Looked up from the batch fetched in run_once(),
-        # not queried live — see get_price_history_stats_bulk().
         history_days, history_low = history_map.get(deal["id"], (0, None))
-        if history_days >= config.PRICE_HISTORY_MIN_DAYS and history_low is not None:
-            ceiling = history_low * (1 + config.PRICE_HISTORY_TOLERANCE_PERCENT / 100)
-            if deal["sale_price"] > ceiling:
-                stats["skipped_not_near_historical_low"] += 1
-                continue
-
-        # Price-history tracking for the embed badge. We only know about
-        # prices from runs where this deal actually posted (below-
-        # threshold prices are never recorded here), so "lowest seen"
-        # means "lowest we've ever alerted on," not the item's true
-        # all-time floor (that's what price_history above is for).
+        reason = _skip_reason(deal, prior, history_days, history_low)
+        if reason is not None:
+            stats[reason] += 1
+            continue
+        # Price-history tracking for the embed badge. "Lowest seen" here means
+        # the lowest we've ever alerted on (seen_deals), versus the item's true
+        # floor in price_history above.
         prior_lowest = (prior or {}).get("lowest_price")
-        is_new_low = prior_lowest is not None and deal["sale_price"] <= prior_lowest
+        deal["is_new_low"] = prior_lowest is not None and deal["sale_price"] <= prior_lowest
         if prior_lowest is not None and prior_lowest < deal["sale_price"]:
             deal["lowest_price"] = prior_lowest
             deal["lowest_price_date"] = prior.get("lowest_price_date")
         else:
             deal["lowest_price"] = deal["sale_price"]
             deal["lowest_price_date"] = datetime.now(timezone.utc).isoformat()
-        deal["is_new_low"] = is_new_low
+        candidates.append(deal)
 
-        # Clean title + short spec extraction — Woot/Best Buy only. Steam
-        # titles ("Elden Ring") are already clean and don't have hardware
-        # specs to extract; forcing the schema on them would either
-        # produce nothing meaningful or pressure the model into
-        # inventing something, which is exactly what this is meant to
-        # avoid. Fails open (see extract_clean_specs) so this can never
-        # block a post.
-        if deal["source"] != "Steam":
-            spec_result = extract_clean_specs(deal["title"])
-            deal["clean_title"] = spec_result["clean_title"]
-            deal["specs"] = spec_result["specs"]
-        else:
+    # ---- PHASE B — batched AI enrichment ----------------------------------
+    # Spec extraction, Woot/Best Buy only. Steam titles are already clean and
+    # have no hardware specs to extract; forcing the schema on them would
+    # either produce nothing or pressure the model into inventing specs.
+    non_steam = [d for d in candidates if d["source"] != "Steam"]
+    if non_steam:
+        spec_results = extract_clean_specs_batch([d["title"] for d in non_steam])
+        for deal, result in zip(non_steam, spec_results):
+            deal["clean_title"] = result["clean_title"]
+            deal["specs"] = result["specs"]
+    for deal in candidates:
+        if deal["source"] == "Steam":
             deal["clean_title"] = deal["title"]
             deal["specs"] = []
 
-        # Optional AI analysis for the Discord embed — fails open to an
-        # empty string (no field), so it can never block a post.
-        deal["analysis"] = build_ai_analysis(deal)
+    # Analysis for every candidate (fails open to "" / no field).
+    analyses = build_ai_analysis_batch(candidates)
+    for deal, analysis in zip(candidates, analyses):
+        deal["analysis"] = analysis
 
+    # ---- PHASE C — post loop ---------------------------------------------
+    for deal in candidates:
         if post_to_discord(deal):
             seen[deal["id"]] = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -262,18 +269,14 @@ def _process_deals(
                     "discount_pct": deal["discount_pct"],
                 }
 
-            # Bluesky candidacy only — actual posting happens after the
-            # loop, capped to the top BLUESKY_MAX_POSTS_PER_RUN by $ saved.
-            # Posting every qualifying deal immediately as it's found,
-            # uncapped, is exactly the "spam firehose on a new account"
-            # this threshold was meant to avoid. Requires a known list
-            # price to rank by savings — the rare deal without one is
-            # excluded from Bluesky consideration (still posts to Discord
-            # as normal).
+            # Bluesky candidacy only — actual posting happens after the loop,
+            # capped to the top BLUESKY_MAX_POSTS_PER_RUN by $ saved. Requires a
+            # known list price to rank by savings.
             if (deal["discount_pct"] is not None and deal["discount_pct"] >= config.BLUESKY_MIN_DISCOUNT_PERCENT
                     and deal["list_price"]):
                 bluesky_candidates.append(deal)
 
+    # ---- PHASE: post-loop — prune, digest, capped bluesky -----------------
     prune_seen(config.SEEN_TTL_DAYS)
     print(
         f"[run] checked {len(all_deals)} deals — "
@@ -310,10 +313,10 @@ def _process_deals(
                 "shadow-classifier",
             )
 
-    # SHADOW MODE: report the deal quality scorer's 1-10 ratings for the
-    # same posts, and what it would have dropped below MIN_QUALITY_SCORE.
-    # Nothing here changes what already posted — observation only, same
-    # promotion discipline as the classifier above.
+    # SHADOW MODE: report the deal quality scorer's 1-10 ratings for the same
+    # posts, and what it would have dropped below MIN_QUALITY_SCORE. Nothing
+    # here changes what already posted — observation only, same promotion
+    # discipline as the classifier above.
     if posted_deals and config.SHADOW_QUALITY_SCORER_WEBHOOK_URL:
         scores, model_used = score_deals(posted_deals)
         if model_used:
@@ -333,8 +336,6 @@ def _process_deals(
                 {"embeds": [build_categorizer_embed(posted_deals, categories, model_used)]},
                 "shadow-categorizer",
             )
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--loop", action="store_true", help="keep running instead of a single pass (local testing only — GitHub Actions uses its own schedule)")

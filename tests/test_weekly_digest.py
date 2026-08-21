@@ -74,49 +74,52 @@ class BuildWeeklyDigestTests(unittest.TestCase):
 
 
 class SupabaseRequestRetryTests(unittest.TestCase):
-    """Retry/backoff behavior of the shared _supabase_request helper."""
+    """Retry/backoff behavior of the shared transport helper, exercised via
+    the weekly_digest Supabase wrapper. Patches the INNER requests.request and
+    time.sleep so the real retry loop runs."""
 
-    @patch("deal_bot.weekly_digest.time.sleep")
-    @patch("deal_bot.weekly_digest.requests.request")
-    def test_success_on_first_try_does_not_sleep(self, mock_request, mock_sleep):
-        mock_request.return_value = _resp(200)
+    @patch("deal_bot.transport.time.sleep")
+    @patch("deal_bot.transport.requests.request")
+    def test_success_on_first_try_does_not_sleep(self, mock_net, mock_sleep):
+        mock_net.return_value = _resp(200)
         with patch.object(config, "SUPABASE_URL", "https://x.supabase.co"), \
              patch.object(config, "SUPABASE_SERVICE_KEY", "k"):
             resp = weekly_digest._supabase_request("GET", "https://x.supabase.co/rest/v1/posted_deals")
         self.assertIsNotNone(resp)
-        self.assertEqual(mock_request.call_count, 1)
+        self.assertEqual(mock_net.call_count, 1)
         mock_sleep.assert_not_called()
 
-    @patch("deal_bot.weekly_digest.time.sleep")
-    @patch("deal_bot.weekly_digest.requests.request")
-    def test_retries_transient_then_succeeds(self, mock_request, mock_sleep):
-        mock_request.side_effect = [_resp(503), _resp(200)]
+    @patch("deal_bot.transport.time.sleep")
+    @patch("deal_bot.transport.requests.request")
+    def test_retries_transient_then_succeeds(self, mock_net, mock_sleep):
+        mock_net.side_effect = [_resp(503), _resp(200)]
         with patch.object(config, "SUPABASE_URL", "https://x.supabase.co"), \
              patch.object(config, "SUPABASE_SERVICE_KEY", "k"):
             resp = weekly_digest._supabase_request("GET", "https://x.supabase.co/rest/v1/posted_deals")
-        self.assertEqual(mock_request.call_count, 2)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(mock_net.call_count, 2)
         self.assertEqual(mock_sleep.call_count, 1)
 
-    @patch("deal_bot.weekly_digest.time.sleep")
-    @patch("deal_bot.weekly_digest.requests.request")
-    def test_exhausts_retries_on_network_error(self, mock_request, mock_sleep):
-        mock_request.side_effect = [requests.RequestException("net")] * 3
+    @patch("deal_bot.transport.time.sleep")
+    @patch("deal_bot.transport.requests.request")
+    def test_exhausts_retries_on_network_error(self, mock_net, mock_sleep):
+        mock_net.side_effect = [requests.RequestException("net")] * 3
         with patch.object(config, "SUPABASE_URL", "https://x.supabase.co"), \
              patch.object(config, "SUPABASE_SERVICE_KEY", "k"):
             resp = weekly_digest._supabase_request("GET", "https://x.supabase.co/rest/v1/posted_deals")
         self.assertIsNone(resp)
-        self.assertEqual(mock_request.call_count, 3)
+        self.assertEqual(mock_net.call_count, 3)
         self.assertEqual(mock_sleep.call_count, 2)
 
-    @patch("deal_bot.weekly_digest.time.sleep")
-    @patch("deal_bot.weekly_digest.requests.request")
-    def test_permanent_4xx_is_not_retried(self, mock_request, mock_sleep):
-        mock_request.return_value = _resp(404)
+    @patch("deal_bot.transport.time.sleep")
+    @patch("deal_bot.transport.requests.request")
+    def test_permanent_4xx_is_not_retried(self, mock_net, mock_sleep):
+        mock_net.return_value = _resp(404)
         with patch.object(config, "SUPABASE_URL", "https://x.supabase.co"), \
              patch.object(config, "SUPABASE_SERVICE_KEY", "k"):
             resp = weekly_digest._supabase_request("GET", "https://x.supabase.co/rest/v1/posted_deals")
         self.assertIsNotNone(resp)  # the 404 response is returned as-is
-        self.assertEqual(mock_request.call_count, 1)
+        self.assertEqual(mock_net.call_count, 1)
         mock_sleep.assert_not_called()
 
 
@@ -151,20 +154,20 @@ class FetchRecentPostedTests(unittest.TestCase):
 class RecordPostedDealTests(unittest.TestCase):
     def test_no_supabase_config_is_a_noop(self):
         with patch.object(config, "SUPABASE_URL", ""):
-            with patch("deal_bot.storage.supabase.requests.post") as mock_post:
+            with patch("deal_bot.storage.supabase.transport.request") as mock_req:
                 supabase.record_posted_deal(_posted(1))
-                mock_post.assert_not_called()
+                mock_req.assert_not_called()
 
-    @patch("deal_bot.storage.supabase.requests.post")
-    def test_missing_table_fails_silent(self, mock_post):
+    @patch("deal_bot.storage.supabase.transport.request")
+    def test_missing_table_fails_silent(self, mock_req):
         resp = Mock()
         resp.status_code = 404
         resp.text = "table does not exist"
-        mock_post.return_value = resp
+        mock_req.return_value = resp
         with patch.object(config, "SUPABASE_URL", "https://x.supabase.co"), \
              patch.object(config, "SUPABASE_SERVICE_KEY", "k"):
             supabase.record_posted_deal(_posted(1))  # must not raise
-        mock_post.assert_called_once()
+        mock_req.assert_called_once()
 
 
 class PrunePostedDealsTests(unittest.TestCase):

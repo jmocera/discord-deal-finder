@@ -12,9 +12,7 @@ constraint on (deal_id, observed_date), upserted via
 
 from datetime import date
 
-import requests
-
-from deal_bot import config
+from deal_bot import config, transport
 from deal_bot.storage.supabase import _supabase_headers
 
 
@@ -33,10 +31,9 @@ def record_price_observations(deals: list[dict]) -> None:
     } for d in deals]
     headers = _supabase_headers()
     headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
-    try:
-        resp = requests.post(url, headers=headers, json=rows, timeout=30)
-    except requests.RequestException as e:
-        print(f"[supabase] price_history upsert failed: {e}")
+    resp = transport.request("POST", url, headers=headers, json=rows, timeout=30)
+    if resp is None:
+        print("[supabase] price_history upsert failed after retries")
         return
     if resp.status_code not in (200, 201, 204):
         print(f"[supabase] price_history upsert returned {resp.status_code}: {resp.text[:300]}")
@@ -66,14 +63,13 @@ def get_price_history_stats_bulk(deal_ids: list[str]) -> dict[str, tuple[int, fl
 
     for i in range(0, len(unique_ids), chunk_size):
         chunk = unique_ids[i:i + chunk_size]
-        try:
-            resp = requests.get(
-                url, headers=_supabase_headers(),
-                params={"deal_id": f"in.({','.join(chunk)})", "select": "deal_id,sale_price,observed_at"},
-                timeout=20,
-            )
-        except requests.RequestException as e:
-            print(f"[supabase] price_history bulk stats failed: {e}")
+        resp = transport.request(
+            "GET", url, headers=_supabase_headers(),
+            params={"deal_id": f"in.({','.join(chunk)})", "select": "deal_id,sale_price,observed_at"},
+            timeout=20,
+        )
+        if resp is None:
+            print("[supabase] price_history bulk stats failed after retries")
             continue
         if resp.status_code != 200:
             print(f"[supabase] price_history bulk stats returned {resp.status_code}: {resp.text[:300]}")
