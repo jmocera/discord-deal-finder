@@ -169,9 +169,15 @@ class RunWeeklyDigestTests(unittest.TestCase):
         mock_call.return_value = "Some roundup text."
 
         with patch("deal_bot.weekly_digest._post_webhook") as mock_webhook, \
-             patch("deal_bot.weekly_digest.post_text_to_bluesky") as mock_bsky:
+             patch("deal_bot.weekly_digest.post_text_to_bluesky") as mock_bsky, \
+             patch.object(config, "DIGEST_WEBHOOK_URL", "https://discord/x"), \
+             patch.object(config, "BLUESKY_HANDLE", "h"), \
+             patch.object(config, "BLUESKY_APP_PASSWORD", "p"):
             result = weekly_digest.run_weekly_digest(dry_run=True)
 
+        # Even with credentials present, a dry-run must short-circuit before
+        # any post — otherwise these assert_not_called checks would hold
+        # vacuously.
         self.assertTrue(result)
         mock_webhook.assert_not_called()
         mock_bsky.assert_not_called()

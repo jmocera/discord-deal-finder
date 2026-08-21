@@ -56,13 +56,14 @@ invisible lost deal).
 
 ## 4. Weekly digest validation + hardening
 
-**Status:** in-progress (initial E2E this session) · **Owner:** done
+**Status:** in-progress · **Owner:** user
 
-- **E2E test pass** — seed fake `posted_deals` rows → `--dry-run` (fetch +
-  build, no post) → live Discord post (Bluesky intentionally skipped) →
-  `workflow_dispatch` the real `weekly_digest.yml` → clear seeded rows.
-- **Pruning** — `posted_deals` grows forever. Add a prune (e.g. delete rows
-  older than ~90 days) so the table stays bounded, mirroring `seen_deals`.
+- **E2E test pass** — verified end-to-end: seed fake `posted_deals` rows →
+  `--dry-run` (fetch + build, no post) → live Discord post (Bluesky
+  intentionally skipped) → `workflow_dispatch` the real `weekly_digest.yml` →
+  clear seeded rows. Live run surfaced and fixed the unbounded-DELETE issue.
+- **Pruning** — done: `prune_posted_deals()` deletes rows older than 90 days
+  on each normal run, so the append-only `posted_deals` table stays bounded.
 - **Per-run AI budget** — the digest makes one Gemma call; fine today, but if
   deal volume climbs, watch `timeout-minutes: 5` headroom.
 
@@ -70,7 +71,7 @@ invisible lost deal).
 
 ## 5. Best Buy source activation
 
-**Status:** blocked · **Owner:** done
+**Status:** blocked · **Owner:** user
 
 - Best Buy API key still pending approval.
 - Once it arrives: verify the long-dormant `quote()` query-encoding logic in
@@ -82,12 +83,13 @@ invisible lost deal).
 
 ## 6. Monetization
 
-**Status:** backlog · **Owner:** done
+**Status:** backlog · **Owner:** user
 
 - No affiliate tagging or `#ad` disclosure exists on the automated pipeline's
   outputs (Woot/Best Buy/Steam) — only manual Amazon posts carry disclosure.
 - **Trigger:** CJ Affiliate (Woot) and/or Impact.com (Best Buy/Walmart)
-  approval. Then wire tags into `deal_bot.py` and add FTC `#ad` to auto-posts.
+  approval. Then wire tags into the `deal_bot` package and add FTC `#ad` to
+  auto-posts.
 - `vet_amazon_deal.py` (manual Amazon assistant) exists but isn't a *required*
   step — adoption is a process/discipline question, not a code one.
 
@@ -95,7 +97,7 @@ invisible lost deal).
 
 ## 7. Reliability
 
-**Status:** backlog · **Owner:** done
+**Status:** backlog · **Owner:** user
 
 - **Webhook false-negative dedupe gap** — if a Discord webhook call succeeds
   server-side but the HTTP response is lost, `seen_deals` never updates and the
@@ -110,7 +112,7 @@ invisible lost deal).
 
 ## 8. Idea backlog (unsized)
 
-**Status:** backlog · **Owner:** done
+**Status:** backlog · **Owner:** user
 
 - **Category-based channel routing** — the category tagger already produces
   storage/display/component/peripheral/game/other; use it to route posts to

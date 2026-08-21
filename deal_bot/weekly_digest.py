@@ -27,7 +27,7 @@ CLI (mostly for testing the digest end-to-end safely):
     python -m deal_bot.weekly_digest --dry-run     # fetch + build, print, post nothing
     python -m deal_bot.weekly_digest --days 14     # widen the lookback window
     python -m deal_bot.weekly_digest --seed 7      # insert 7 fake rows (testing)
-    python -m deal_bot.weekly_digest --clear       # delete every posted_deals row (testing cleanup)
+    python -m deal_bot.weekly_digest --clear       # delete seeded (seed:) rows (testing cleanup)
     python -m deal_bot.weekly_digest --no-bluesky  # skip the Bluesky post (E2E testing)
 """
 
@@ -50,8 +50,12 @@ def fetch_recent_posted(days: int = 7, limit: int | None = None) -> list[dict]:
         return []
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     url = f"{config.SUPABASE_URL}/rest/v1/posted_deals"
-    params = {"posted_at": f"gt.{cutoff}", "select": "id,source,title,url,sale_price,list_price"}
-    if limit:
+    params = {
+        "posted_at": f"gt.{cutoff}",
+        "select": "id,source,title,url,sale_price,list_price",
+        "order": "posted_at.desc",
+    }
+    if limit is not None and limit > 0:
         params["limit"] = str(limit)
     try:
         resp = requests.get(url, headers=_supabase_headers(), params=params, timeout=15)
@@ -207,21 +211,29 @@ def run_weekly_digest(days: int = 7, limit: int | None = None, dry_run: bool = F
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weekly AI deal roundup")
-    parser.add_argument("--dry-run", action="store_true", help="fetch + build + print, post nothing")
+    parser.add_argument("--dry-run", action="store_true", help="fetch + build + print, post nothing (no DB mutation either)")
     parser.add_argument("--days", type=int, default=7, help="lookback window in days")
-    parser.add_argument("--limit", type=int, default=None, help="max rows to fetch")
+    parser.add_argument("--limit", type=int, default=None, help="max most-recent rows to fetch")
     parser.add_argument("--seed", type=int, default=None, metavar="N", help="insert N fake rows (testing)")
-    parser.add_argument("--clear", action="store_true", help="delete all posted_deals rows (testing cleanup)")
+    parser.add_argument("--clear", action="store_true", help="delete seeded (seed:) rows from testing (testing cleanup)")
     parser.add_argument("--no-bluesky", action="store_true", help="skip the Bluesky post (E2E testing)")
     args = parser.parse_args()
 
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be a positive integer")
+
     if args.seed is not None:
+        if args.seed < 1:
+            parser.error("--seed N must be a positive integer")
         seed_posted_deals(args.seed)
     elif args.clear:
         clear_posted_deals()
     else:
-        # Normal run: prune old rows, then generate the digest.
-        prune_posted_deals()
+        # Normal run: prune old rows, then generate the digest. A dry-run
+        # is a pure preview — it must not mutate the database, so pruning is
+        # skipped there too (prune is a destructive DELETE).
+        if not args.dry_run:
+            prune_posted_deals()
         run_weekly_digest(days=args.days, limit=args.limit, dry_run=args.dry_run, skip_bluesky=args.no_bluesky)
 
 
