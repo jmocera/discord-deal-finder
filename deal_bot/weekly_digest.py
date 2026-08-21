@@ -120,20 +120,24 @@ def seed_posted_deals(count: int = 7) -> None:
 
 
 def clear_posted_deals() -> None:
-    """Delete every posted_deals row (cleanup after a seed-based E2E)."""
+    """Delete every row seeded by seed_posted_deals (id prefix 'seed:') —
+    cleanup after a seed-based E2E. PostgREST refuses unbounded DELETEs, so
+    we scope to the seed prefix rather than wiping the whole table."""
     if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_KEY:
         print("[weekly] no Supabase config — nothing to clear")
         return
     url = f"{config.SUPABASE_URL}/rest/v1/posted_deals"
     try:
-        resp = requests.delete(url, headers=_supabase_headers(), timeout=15)
+        resp = requests.delete(
+            url, headers=_supabase_headers(), params={"id": "like.seed:%"}, timeout=15
+        )
     except requests.RequestException as e:
         print(f"[weekly] clear failed: {e}")
         return
     if resp.status_code not in (200, 204):
         print(f"[weekly] clear returned {resp.status_code}: {resp.text[:300]}")
         return
-    print("[weekly] cleared all posted_deals rows")
+    print("[weekly] cleared all seeded (seed:) posted_deals rows")
 
 
 def build_weekly_digest(deals: list[dict]) -> str:

@@ -141,7 +141,7 @@ class SeedClearPostedDealsTests(unittest.TestCase):
                 mock_delete.assert_not_called()
 
     @patch("deal_bot.weekly_digest.requests.delete")
-    def test_clear_deletes_all(self, mock_delete):
+    def test_clear_deletes_seeded_rows_only(self, mock_delete):
         resp = Mock()
         resp.status_code = 204
         mock_delete.return_value = resp
@@ -149,6 +149,9 @@ class SeedClearPostedDealsTests(unittest.TestCase):
              patch.object(config, "SUPABASE_SERVICE_KEY", "k"):
             weekly_digest.clear_posted_deals()
         mock_delete.assert_called_once()
+        # PostgREST requires a WHERE clause; scope to the seed prefix so the
+        # whole table is never wiped.
+        self.assertEqual(mock_delete.call_args.kwargs["params"]["id"], "like.seed:%")
 
 
 class RunWeeklyDigestTests(unittest.TestCase):
