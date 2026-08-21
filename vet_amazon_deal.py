@@ -2,11 +2,12 @@
 """
 vet_amazon_deal.py — standalone assistant for VoltDrop's manual Amazon
 deal-posting workflow (see VoltDrop_Project_Scope.md §9). Amazon isn't a
-deal_bot.py data source (no scripted API access, no affiliate program wired
-into the automated pipeline yet), so deals are still found and posted by
-hand — this tool replaces the operator's manual credibility checklist and
-copy-paste formatting with a repeatable one, it does not post anything
-itself and is never invoked by deal_bot.py or the GitHub Actions cron.
+data source in the automated deal_bot package (no scripted API access, no
+affiliate program wired into the automated pipeline yet), so deals are
+still found and posted by hand — this tool replaces the operator's manual
+credibility checklist and copy-paste formatting with a repeatable one, it
+does not post anything itself and is never invoked by the deal_bot package
+or the GitHub Actions cron.
 
 Takes a product URL, pasted page text, or a screenshot; extracts a clean
 title, price, seller type, review count, and rating; runs the same
@@ -46,6 +47,8 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from deal_bot.ai.client import _call_openrouter
+
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # Report output uses a star glyph (see format_discord_copy) — on Windows,
@@ -62,7 +65,8 @@ except (AttributeError, ValueError):
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+# OPENROUTER_API_KEY is read by the shared client in deal_bot.ai.client (which
+# pulls it from deal_bot.config) rather than being re-read locally.
 OPENROUTER_AMAZON_TEXT_MODEL = os.environ.get("OPENROUTER_AMAZON_TEXT_MODEL", "google/gemini-2.5-flash-lite")
 OPENROUTER_AMAZON_VISION_MODEL = os.environ.get("OPENROUTER_AMAZON_VISION_MODEL", "google/gemini-2.5-flash")
 
@@ -212,73 +216,19 @@ def _encode_image(path: Path) -> tuple[str, str] | None:
 # ---------------------------------------------------------------------------
 # OPENROUTER
 # ---------------------------------------------------------------------------
-def _call_openrouter(
-    model: str, system_prompt: str, user_content, *,
-    temperature: float = 0.0, max_tokens: int = 500,
-    response_format: dict | None = None, timeout: int = 20,
-) -> str | None:
-    """Same fail-open pattern as deal_bot.py's _call_openrouter: missing
-    key, a network error, a non-200, or empty content all just return
-    None rather than raising — callers fall back to an all-null field set
-    rather than this ever crashing the tool. `user_content` can be a
-    plain string (text mode) or a list of OpenRouter content blocks
-    (vision mode) — both are valid values for the "content" field.
-
-    Reasoning is deliberately never set here: this reuses the exact model
-    (google/gemini-2.5-flash-lite) deal_bot.py's spec extraction already
-    confirmed performs worse with any reasoning effort set, even "low" —
-    omitting the parameter entirely is what makes it reliable."""
-    if not OPENROUTER_API_KEY:
-        return None
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    if response_format is not None:
-        payload["response_format"] = response_format
-    try:
-        resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=timeout,
-        )
-    except requests.RequestException as e:
-        print(f"[openrouter] request failed for model {model}: {e}")
-        return None
-    if resp.status_code != 200:
-        print(f"[openrouter] model {model} returned {resp.status_code}: {resp.text[:300]}")
-        return None
-    try:
-        content = resp.json()["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, ValueError, TypeError) as e:
-        print(f"[openrouter] unexpected response shape from {model}: {e}")
-        return None
-    if not content:
-        print(f"[openrouter] {model} returned no usable content")
-        return None
-    content = content.strip()
-    # A few models wrap JSON in a markdown code fence despite being told
-    # not to — strip one if present rather than rejecting the whole thing.
-    if content.startswith("```"):
-        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content).strip()
-    return content or None
-
+# Shared client: `_call_openrouter` is imported from deal_bot.ai.client (the
+# single source of truth for the page URL, auth header, fail-open handling,
+# and code-fence stripping). Reasoning is deliberately never set for this
+# tool's models — the same "omit reasoning entirely" finding as
+# deal_bot's spec extraction, confirmed empirically for
+# google/gemini-2.5-flash-lite.
 
 # ---------------------------------------------------------------------------
 # EXTRACTION → VALIDATED FIELDS
 # ---------------------------------------------------------------------------
 def _parse_vetting_json(content: str | None) -> dict:
     """Strict per-field validation, no coercion — same posture as
-    deal_bot.py's extract_clean_specs: a field that doesn't match the
+    deal_bot's extract_clean_specs: a field that doesn't match the
     expected type/shape falls back to None rather than being guessed
     into something usable, since a wrong price or seller type here feeds
     directly into a credibility judgment."""
@@ -426,7 +376,7 @@ def _finalize_vetting(fields: dict, source_url: str | None) -> dict:
 def vet_from_text(raw_text: str, source_url: str | None = None) -> dict:
     content = _call_openrouter(
         OPENROUTER_AMAZON_TEXT_MODEL, TEXT_SYSTEM_PROMPT, f"Page content:\n{raw_text[:8000]}",
-        max_tokens=400, response_format={"type": "json_object"}, timeout=20,
+        temperature=0.0, max_tokens=400, response_format={"type": "json_object"}, timeout=20,
     )
     fields = _parse_vetting_json(content)
     return _finalize_vetting(fields, source_url)
@@ -444,7 +394,7 @@ def vet_from_image(image_path: str, source_url: str | None = None) -> dict:
         ]
         content = _call_openrouter(
             OPENROUTER_AMAZON_VISION_MODEL, VISION_SYSTEM_PROMPT, user_content,
-            max_tokens=400, response_format={"type": "json_object"}, timeout=30,
+            temperature=0.0, max_tokens=400, response_format={"type": "json_object"}, timeout=30,
         )
         fields = _parse_vetting_json(content)
     return _finalize_vetting(fields, source_url)

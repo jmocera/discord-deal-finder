@@ -1,0 +1,33 @@
+name: weekly-digest
+
+"on":
+  schedule:
+    # Mondays at noon UTC — a once-a-week curated roundup of the week's
+    # posted deals, distinct from the 4-hourly deal-bot schedule.
+    - cron: "0 12 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run weekly digest
+        run: python -m deal_bot.weekly_digest
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DIGEST_WEBHOOK_URL: ${{ secrets.DIGEST_WEBHOOK_URL }}
+          BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
+          BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_WEEKLY_DIGEST_MODEL: ${{ vars.OPENROUTER_WEEKLY_DIGEST_MODEL }}
+          OPENROUTER_WEEKLY_DIGEST_FALLBACK_MODEL: ${{ vars.OPENROUTER_WEEKLY_DIGEST_FALLBACK_MODEL }}

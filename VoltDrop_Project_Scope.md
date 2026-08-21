@@ -8,14 +8,14 @@
 
 ## 1. System overview
 
-VoltDrop's automated side is a single Python script (`deal_bot.py`) that runs unattended on a GitHub Actions schedule (every 4 hours), with no server and no persistent local process:
+VoltDrop's automated side is a Python package (`deal_bot/`, run via `python -m deal_bot`) that runs unattended on a GitHub Actions schedule (every 4 hours), with no server and no persistent local process:
 
 ```
  Woot API    Best Buy API    Steam API
     │             │              │
     └─────────────┼──────────────┘
                    ▼
-            deal_bot.py (GitHub Actions, cron every 4h)
+            deal_bot (GitHub Actions, cron every 4h)
                    │
    ┌───────────────┼────────────────────┬─────────────────┐
    ▼               ▼                    ▼                 ▼
@@ -124,18 +124,18 @@ Previously, this project had zero automated tests — everything was verified vi
 
 | Program | Status | Notes |
 |---|---|---|
-| Amazon Associates | Approved and active. Tag: `voltdrop05-20` | Not wired into the automated pipeline — Amazon isn't a `deal_bot.py` data source. Applied manually via `?tag=` on manually-sourced links. |
+| Amazon Associates | Approved and active. Tag: `voltdrop05-20` | Not wired into the automated pipeline — Amazon isn't a `deal_bot` data source. Applied manually via `?tag=` on manually-sourced links. |
 | CJ Affiliate (covers Woot) | Application submitted, under review | Response time reportedly inconsistent per Woot forums — could be weeks. |
 | Impact.com (covers Best Buy + Walmart) | Researched, not yet submitted | Recommended next step. |
 | Best Buy Developer API | Key requested, pending approval | Separate from the affiliate program above — this is data access, not commission (see §2). |
 | Newegg | No public affiliate path found | Real path would be an affiliate network (possibly CJ), not yet pursued. |
 | Steam | No affiliate program exists | Long-standing Valve policy — kept as a content-variety source only, not a monetization path. |
 
-**FTC disclosure:** `#ad` is applied on manual Amazon posts using the affiliate tag. **Not yet relevant to the automated pipeline** — none of Woot/Best Buy/Steam currently carry affiliate codes, since none of those programs are approved yet. This will need to be built into `deal_bot.py` once CJ/Impact.com approvals land (see §11).
+**FTC disclosure:** `#ad` is applied on manual Amazon posts using the affiliate tag. **Not yet relevant to the automated pipeline** — none of Woot/Best Buy/Steam currently carry affiliate codes, since none of those programs are approved yet. This will need to be built into `deal_bot` once CJ/Impact.com approvals land (see §11).
 
 ## 9. Manual deal-posting workflow (Amazon)
 
-*(Reported by the operator; entirely separate from `deal_bot.py` — Amazon isn't a scripted data source, so none of this runs through the automated pipeline.)*
+*(Reported by the operator; entirely separate from `deal_bot` — Amazon isn't a scripted data source, so none of this runs through the automated pipeline.)*
 
 The operator sources deals manually via screenshots, drafting captions using only visible, real data. Credibility checklist applied to every manual find:
 
@@ -148,7 +148,7 @@ The operator sources deals manually via screenshots, drafting captions using onl
 
 *(Unlike the rest of §9, this subsection is drawn from this session's own work — real OpenRouter API calls and real CLI runs, not operator reporting.)*
 
-A standalone CLI that formalizes the checklist above into a repeatable tool, rather than relying on the operator applying it by hand each time. **Explicitly not wired into `deal_bot.py` or the GitHub Actions cron** — same as the rest of §9, Amazon stays a manual, operator-run workflow; this tool assists that workflow, it doesn't automate it away.
+A standalone CLI that formalizes the checklist above into a repeatable tool, rather than relying on the operator applying it by hand each time. **Explicitly not wired into `deal_bot` or the GitHub Actions cron** — same as the rest of §9, Amazon stays a manual, operator-run workflow; this tool assists that workflow, it doesn't automate it away.
 
 - **Three input modes:** a product URL (best-effort page fetch — a plain GET with a normal browser User-Agent, no proxies, no CAPTCHA-solving, no fingerprint spoofing; when Amazon blocks it, which is common, the tool says so and still returns the canonicalized affiliate link from the ASIN alone, just without full field extraction), raw pasted page text, or a product screenshot (vision).
 - **Extraction via OpenRouter, not decision-making:** text/URL mode reuses `google/gemini-2.5-flash-lite` — the same model, and the same "omit the `reasoning` parameter entirely" finding, as Feature 1's spec extraction (§6.3, §5 item 6). Vision/screenshot mode uses `google/gemini-2.5-flash`. Every extracted field (`clean_title`, `sale_price`, `list_or_typical_price`, `seller_type`, `review_count`, `rating`) is strictly type/range-validated with no coercion — a malformed field falls back to `null` rather than being guessed, same posture as `extract_clean_specs`.
@@ -175,19 +175,19 @@ A standalone CLI that formalizes the checklist above into a repeatable tool, rat
 3. **Webhook false-negative dedupe gap** (§5, item 8) — real, rare, not yet fixed.
 4. **One scheduled run was silently skipped by GitHub** with no root cause found (not an active GitHub incident, not a repo/billing issue) — a single occurrence so far, worth treating as a pattern if it recurs rather than a settled problem.
 5. **Reasoning-effort behavior is genuinely model-specific, not a fixed rule** — three different OpenRouter models needed three different configurations this session (see §5, item 6). Worth re-verifying empirically, not assuming, whenever a new model gets added to this pipeline.
-6. **No affiliate tagging or `#ad` disclosure exists yet on the automated pipeline's outputs** (Woot/Best Buy/Steam) — only manual Amazon posts currently carry disclosure (§9). **Still open after Feature 3** — `vet_amazon_deal.py` (§9.1) only touches the manual Amazon workflow; it has no connection to `deal_bot.py` and does nothing for Woot/Best Buy/Steam. This still needs to be built into `deal_bot.py` before any of the pending affiliate programs (§8) can actually monetize those sources.
+6. **No affiliate tagging or `#ad` disclosure exists yet on the automated pipeline's outputs** (Woot/Best Buy/Steam) — only manual Amazon posts currently carry disclosure (§9). **Still open after Feature 3** — `vet_amazon_deal.py` (§9.1) only touches the manual Amazon workflow; it has no connection to `deal_bot` and does nothing for Woot/Best Buy/Steam. This still needs to be built into `deal_bot` before any of the pending affiliate programs (§8) can actually monetize those sources.
 7. **CJ Affiliate and Impact.com applications are both still pending/not started** — until either lands, the automated pipeline's Woot/Best Buy links have no monetization path even once #6 above is built.
 8. **`vet_amazon_deal.py` (§9.1) isn't yet a required step** — nothing stops the operator from posting an Amazon deal by hand without running it first. Adoption is a process/discipline question, not a code one; nothing in this pipeline currently enforces it.
-9. ~~This session's 66 new tests have not yet been observed passing in a real GitHub Actions run~~ — **resolved.** Manually triggered via `workflow_dispatch` (run `31971559541`, 2026-08-16 20:47 UTC): CI reported `Ran 90 tests ... OK`, and the subsequent live `deal_bot.py` step completed normally (308 deals checked, 0 posted this cycle — no unexpected production posts). No workflow changes were needed; `discover -s tests -p "test_*.py"` already picks up new files under `tests/` automatically.
+9. ~~This session's 66 new tests have not yet been observed passing in a real GitHub Actions run~~ — **resolved.** Manually triggered via `workflow_dispatch` (run `31971559541`, 2026-08-16 20:47 UTC): CI reported `Ran 90 tests ... OK`, and the subsequent live `deal_bot` step completed normally (308 deals checked, 0 posted this cycle — no unexpected production posts). No workflow changes were needed; `discover -s tests -p "test_*.py"` already picks up new files under `tests/` automatically.
 
 ---
 
 ## Handoff summary
 
-As of this session, `deal_bot.py` runs unattended on a 4-hour GitHub Actions schedule, pulling from Woot and Steam (Best Buy pending its API key), filtering through keyword/discount/price-history gates, and posting to 7 Discord channels and Bluesky. Two AI features are fully live and tested against real data: data-backed caption "verdicts" (Feature 2, upgraded from generic marketing copy) and clean title/spec extraction (Feature 1) — both fail open to safe defaults on any failure. A third AI feature, a desirability classifier, is deliberately running in observation-only shadow mode pending more real-world review. Bluesky posts carry rich link-preview cards and clickable hashtags via raw AT Protocol calls. A 90-test stdlib suite is wired into the same CI step ahead of every scheduled execution (`if: always()` on the bot-execution step), so a test failure is visible but can never silently block the unattended pipeline.
+As of this session, `deal_bot` runs unattended on a 4-hour GitHub Actions schedule, pulling from Woot and Steam (Best Buy pending its API key), filtering through keyword/discount/price-history gates, and posting to 7 Discord channels and Bluesky. Two AI features are fully live and tested against real data: data-backed caption "verdicts" (Feature 2, upgraded from generic marketing copy) and clean title/spec extraction (Feature 1) — both fail open to safe defaults on any failure. A third AI feature, a desirability classifier, is deliberately running in observation-only shadow mode pending more real-world review. Bluesky posts carry rich link-preview cards and clickable hashtags via raw AT Protocol calls. A 90-test stdlib suite is wired into the same CI step ahead of every scheduled execution (`if: always()` on the bot-execution step), so a test failure is visible but can never silently block the unattended pipeline.
 
 Separately, a new standalone tool, `vet_amazon_deal.py` (Feature 3, §9.1), formalizes the operator's existing manual Amazon credibility checklist into a repeatable CLI — text/URL/screenshot ingestion via OpenRouter, deterministic (non-LLM) risk assessment, ASIN-based affiliate-link canonicalization (`voltdrop05-20`), and `#ad`-first ready-to-copy output. It is explicitly **not** part of the automated pipeline and doesn't change automated-pipeline monetization status at all.
 
-On the business side more broadly (§§8-10, operator-reported): Amazon Associates is approved and active but only feeds the manual posting workflow (now assisted by §9.1), not the automated pipeline; CJ Affiliate (Woot) and Impact.com (Best Buy/Walmart) applications are pending/not yet submitted; and no affiliate tagging or FTC disclosure exists yet on any *automated*-pipeline output — that gap (§11 item 6) is unchanged by Feature 3 and still needs to be built into `deal_bot.py` before those programs can monetize Woot/Best Buy traffic once approved.
+On the business side more broadly (§§8-10, operator-reported): Amazon Associates is approved and active but only feeds the manual posting workflow (now assisted by §9.1), not the automated pipeline; CJ Affiliate (Woot) and Impact.com (Best Buy/Walmart) applications are pending/not yet submitted; and no affiliate tagging or FTC disclosure exists yet on any *automated*-pipeline output — that gap (§11 item 6) is unchanged by Feature 3 and still needs to be built into `deal_bot` before those programs can monetize Woot/Best Buy traffic once approved.
 
 Nine open items remain (§11), none blocking normal operation. For exact schemas, commands, and the full historical bug list, see `HANDOFF.md` in this repo.

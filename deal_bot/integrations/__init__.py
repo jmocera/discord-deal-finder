@@ -1,0 +1,1 @@
+"""Outbound integrations: Discord webhooks and Bluesky posts."""

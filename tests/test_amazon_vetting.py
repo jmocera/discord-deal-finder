@@ -15,10 +15,11 @@ import json
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, mock_open, patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import vet_amazon_deal as vet
+from deal_bot import config
 
 
 def _mock_response(status_code=200, json_data=None, text="", url=None):
@@ -193,12 +194,6 @@ class ParseVettingJsonTests(unittest.TestCase):
         }))
         self.assertIsNone(fields["clean_title"])
 
-    def test_code_fence_wrapped_json_is_stripped_before_parsing(self):
-        # _call_openrouter strips the fence; _parse_vetting_json just
-        # needs to receive already-clean JSON — verified via the full
-        # _call_openrouter path in OpenRouterCallTests below instead.
-        pass
-
 
 # ---------------------------------------------------------------------------
 # compute_risk_assessment — deterministic Python, not model judgment
@@ -332,41 +327,41 @@ class CopyFormattingTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class OpenRouterCallTests(unittest.TestCase):
     def setUp(self):
-        self._orig_key = vet.OPENROUTER_API_KEY
-        vet.OPENROUTER_API_KEY = "test-key"
+        self._orig_key = config.OPENROUTER_API_KEY
+        config.OPENROUTER_API_KEY = "test-key"
 
     def tearDown(self):
-        vet.OPENROUTER_API_KEY = self._orig_key
+        config.OPENROUTER_API_KEY = self._orig_key
 
     def test_missing_api_key_skips_network_call(self):
-        vet.OPENROUTER_API_KEY = ""
-        with patch("vet_amazon_deal.requests.post") as mock_post:
+        config.OPENROUTER_API_KEY = ""
+        with patch("deal_bot.ai.client.requests.post") as mock_post:
             result = vet._call_openrouter("some-model", "system", "user")
             mock_post.assert_not_called()
         self.assertIsNone(result)
 
-    @patch("vet_amazon_deal.requests.post")
+    @patch("deal_bot.ai.client.requests.post")
     def test_network_timeout_returns_none(self, mock_post):
         mock_post.side_effect = vet.requests.exceptions.Timeout("timed out")
         self.assertIsNone(vet._call_openrouter("some-model", "system", "user"))
 
-    @patch("vet_amazon_deal.requests.post")
+    @patch("deal_bot.ai.client.requests.post")
     def test_http_500_returns_none(self, mock_post):
         mock_post.return_value = _mock_response(500, text="internal server error")
         self.assertIsNone(vet._call_openrouter("some-model", "system", "user"))
 
-    @patch("vet_amazon_deal.requests.post")
+    @patch("deal_bot.ai.client.requests.post")
     def test_empty_content_returns_none(self, mock_post):
         mock_post.return_value = _openrouter_response("")
         self.assertIsNone(vet._call_openrouter("some-model", "system", "user"))
 
-    @patch("vet_amazon_deal.requests.post")
+    @patch("deal_bot.ai.client.requests.post")
     def test_code_fence_wrapped_json_is_stripped(self, mock_post):
         mock_post.return_value = _openrouter_response('```json\n{"a": 1}\n```')
         result = vet._call_openrouter("some-model", "system", "user")
         self.assertEqual(result, '{"a": 1}')
 
-    @patch("vet_amazon_deal.requests.post")
+    @patch("deal_bot.ai.client.requests.post")
     def test_list_user_content_accepted_for_vision(self, mock_post):
         mock_post.return_value = _openrouter_response('{"ok": true}')
         content_blocks = [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}]
@@ -381,13 +376,13 @@ class OpenRouterCallTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class VetFromTextTests(unittest.TestCase):
     def setUp(self):
-        self._orig_key = vet.OPENROUTER_API_KEY
-        vet.OPENROUTER_API_KEY = "test-key"
+        self._orig_key = config.OPENROUTER_API_KEY
+        config.OPENROUTER_API_KEY = "test-key"
 
     def tearDown(self):
-        vet.OPENROUTER_API_KEY = self._orig_key
+        config.OPENROUTER_API_KEY = self._orig_key
 
-    @patch("vet_amazon_deal.requests.post")
+    @patch("deal_bot.ai.client.requests.post")
     def test_full_pipeline_with_url_produces_canonical_link_and_risk(self, mock_post):
         mock_post.return_value = _openrouter_response(json.dumps({
             "clean_title": "Crucial P3 Plus 2TB NVMe SSD", "sale_price": 79.99,
@@ -399,7 +394,7 @@ class VetFromTextTests(unittest.TestCase):
         self.assertEqual(result["canonical_url"], "https://www.amazon.com/dp/B08N5WRWNW?tag=voltdrop05-20")
         self.assertTrue(result["risk_assessment"]["passed"])
 
-    @patch("vet_amazon_deal.requests.post")
+    @patch("deal_bot.ai.client.requests.post")
     def test_no_source_url_means_no_canonical_link(self, mock_post):
         mock_post.return_value = _openrouter_response(json.dumps({
             "clean_title": "Some Product", "sale_price": 10.0, "list_or_typical_price": None,
@@ -409,7 +404,7 @@ class VetFromTextTests(unittest.TestCase):
         self.assertIsNone(result["asin"])
         self.assertIsNone(result["canonical_url"])
 
-    @patch("vet_amazon_deal.requests.post")
+    @patch("deal_bot.ai.client.requests.post")
     def test_openrouter_failure_still_returns_a_full_shape_with_risk_assessment(self, mock_post):
         mock_post.side_effect = vet.requests.exceptions.Timeout("timed out")
         result = vet.vet_from_text("pasted page text", source_url="https://www.amazon.com/dp/B08N5WRWNW")
@@ -420,13 +415,13 @@ class VetFromTextTests(unittest.TestCase):
 
 class VetFromImageTests(unittest.TestCase):
     def setUp(self):
-        self._orig_key = vet.OPENROUTER_API_KEY
-        vet.OPENROUTER_API_KEY = "test-key"
+        self._orig_key = config.OPENROUTER_API_KEY
+        config.OPENROUTER_API_KEY = "test-key"
 
     def tearDown(self):
-        vet.OPENROUTER_API_KEY = self._orig_key
+        config.OPENROUTER_API_KEY = self._orig_key
 
-    @patch("vet_amazon_deal.requests.post")
+    @patch("deal_bot.ai.client.requests.post")
     def test_full_pipeline_reads_and_encodes_real_file(self, mock_post):
         mock_post.return_value = _openrouter_response(json.dumps({
             "clean_title": "Crucial P3 Plus 2TB NVMe SSD", "sale_price": 79.99,
@@ -444,14 +439,14 @@ class VetFromImageTests(unittest.TestCase):
         self.assertTrue(any(block.get("type") == "image_url" for block in sent_content))
 
     def test_missing_file_falls_back_without_calling_openrouter(self):
-        with patch("vet_amazon_deal.requests.post") as mock_post:
+        with patch("deal_bot.ai.client.requests.post") as mock_post:
             result = vet.vet_from_image("does/not/exist.png")
             mock_post.assert_not_called()
         self.assertEqual(result["clean_title"], vet._EMPTY_FIELDS["clean_title"])
 
     def test_oversized_image_falls_back_without_calling_openrouter(self):
         with patch("pathlib.Path.read_bytes", return_value=b"0" * (vet._MAX_IMAGE_BYTES + 1)), \
-             patch("vet_amazon_deal.requests.post") as mock_post:
+             patch("deal_bot.ai.client.requests.post") as mock_post:
             result = vet.vet_from_image("huge.png")
             mock_post.assert_not_called()
         self.assertIsNone(result["clean_title"])
@@ -510,7 +505,7 @@ class RunUrlModeRoutingTests(unittest.TestCase):
 
     @patch("vet_amazon_deal.fetch_amazon_page_text", return_value=None)
     def test_failed_fetch_does_not_call_openrouter(self, mock_fetch):
-        with patch("vet_amazon_deal.requests.post") as mock_post:
+        with patch("deal_bot.ai.client.requests.post") as mock_post:
             vet.run_url_mode("https://www.amazon.com/dp/B08N5WRWNW")
             mock_post.assert_not_called()
 

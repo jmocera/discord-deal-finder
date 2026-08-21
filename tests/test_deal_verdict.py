@@ -15,7 +15,9 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import deal_bot as db
+
+from deal_bot.ai import captions
+from deal_bot.integrations import bluesky
 
 
 def _make_deal(**overrides) -> dict:
@@ -31,12 +33,12 @@ def _make_deal(**overrides) -> dict:
 
 
 class BuildAiCaptionVerdictTests(unittest.TestCase):
-    @patch("deal_bot._call_openrouter")
+    @patch("deal_bot.ai.captions._call_openrouter")
     def test_new_low_deal_gets_all_time_low_context_in_the_prompt(self, mock_call):
         mock_call.return_value = "Genuine all-time low for this drive. #PCBuild #SSDDeals"
         deal = _make_deal(is_new_low=True)
 
-        result = db.build_ai_caption(deal)
+        result = captions.build_ai_caption(deal)
 
         # The point of this test: the *prompt actually sent to the model*
         # carries the historical-low signal, not just that some caption
@@ -46,57 +48,57 @@ class BuildAiCaptionVerdictTests(unittest.TestCase):
         self.assertIn("all-time low", sent_user_prompt.lower())
         self.assertTrue(result.startswith("Genuine all-time low"))
 
-    @patch("deal_bot._call_openrouter")
+    @patch("deal_bot.ai.captions._call_openrouter")
     def test_not_new_low_but_known_floor_price_is_still_passed_as_context(self, mock_call):
         mock_call.return_value = "Solid price, though not its floor. #PCBuild"
         deal = _make_deal(is_new_low=False, sale_price=79.99, lowest_price=59.99)
 
-        db.build_ai_caption(deal)
+        captions.build_ai_caption(deal)
 
         sent_user_prompt = mock_call.call_args[0][2]
         self.assertIn("59.99", sent_user_prompt)
 
-    @patch("deal_bot._call_openrouter")
+    @patch("deal_bot.ai.captions._call_openrouter")
     def test_specs_are_included_in_the_prompt_when_present(self, mock_call):
         mock_call.return_value = "Fast NVMe storage at a real floor price. #PCBuild"
         deal = _make_deal(specs=["Capacity: 2TB", "Interface: PCIe Gen4"])
 
-        db.build_ai_caption(deal)
+        captions.build_ai_caption(deal)
 
         sent_user_prompt = mock_call.call_args[0][2]
         self.assertIn("Capacity: 2TB", sent_user_prompt)
         self.assertIn("Interface: PCIe Gen4", sent_user_prompt)
 
-    @patch("deal_bot._call_openrouter")
+    @patch("deal_bot.ai.captions._call_openrouter")
     def test_falls_back_to_template_when_both_models_return_none(self, mock_call):
         mock_call.return_value = None
         deal = _make_deal()
 
-        result = db.build_ai_caption(deal)
+        result = captions.build_ai_caption(deal)
 
-        self.assertEqual(result, db.build_x_caption(deal))
+        self.assertEqual(result, captions.build_x_caption(deal))
         self.assertEqual(mock_call.call_count, 2)  # tried primary, then fallback model
 
-    @patch("deal_bot._call_openrouter")
+    @patch("deal_bot.ai.captions._call_openrouter")
     def test_falls_back_when_response_exceeds_length_ceiling(self, mock_call):
         mock_call.return_value = "X" * 300  # over the 260-char sanity ceiling
         deal = _make_deal()
 
-        result = db.build_ai_caption(deal)
+        result = captions.build_ai_caption(deal)
 
-        self.assertEqual(result, db.build_x_caption(deal))
+        self.assertEqual(result, captions.build_x_caption(deal))
 
-    @patch("deal_bot._call_openrouter")
+    @patch("deal_bot.ai.captions._call_openrouter")
     def test_falls_back_when_hashtags_look_spammy(self, mock_call):
         spammy = "Good deal. " + " ".join(f"#tag{i}" for i in range(10))  # way over 4
         mock_call.return_value = spammy
         deal = _make_deal()
 
-        result = db.build_ai_caption(deal)
+        result = captions.build_ai_caption(deal)
 
-        self.assertEqual(result, db.build_x_caption(deal))
+        self.assertEqual(result, captions.build_x_caption(deal))
 
-    @patch("deal_bot._call_openrouter")
+    @patch("deal_bot.ai.captions._call_openrouter")
     def test_contextual_hashtags_are_kept_not_restricted_to_a_fixed_list(self, mock_call):
         # Deliberate: item-specific hashtags are preserved as-is rather
         # than filtered down to a fixed vocabulary — see the confirmed
@@ -105,7 +107,7 @@ class BuildAiCaptionVerdictTests(unittest.TestCase):
         mock_call.return_value = "Real all-time low for this SSD. #SSDDeals #PCBuild #TechDeals"
         deal = _make_deal(is_new_low=True)
 
-        result = db.build_ai_caption(deal)
+        result = captions.build_ai_caption(deal)
 
         self.assertIn("#SSDDeals", result)
         self.assertIn("#PCBuild", result)
@@ -114,14 +116,14 @@ class BuildAiCaptionVerdictTests(unittest.TestCase):
 
 class HashtagSanityCheckTests(unittest.TestCase):
     def test_reasonable_hashtag_count_passes(self):
-        self.assertTrue(db._hashtags_look_reasonable("Good deal. #PCBuild #SSDDeals #TechDeals"))
+        self.assertTrue(captions._hashtags_look_reasonable("Good deal. #PCBuild #SSDDeals #TechDeals"))
 
     def test_no_hashtags_passes(self):
-        self.assertTrue(db._hashtags_look_reasonable("Good deal, no tags here."))
+        self.assertTrue(captions._hashtags_look_reasonable("Good deal, no tags here."))
 
     def test_too_many_hashtags_fails(self):
         text = "Deal. " + " ".join(f"#tag{i}" for i in range(6))
-        self.assertFalse(db._hashtags_look_reasonable(text))
+        self.assertFalse(captions._hashtags_look_reasonable(text))
 
 
 class BlueskyLengthLimitTests(unittest.TestCase):
@@ -129,10 +131,10 @@ class BlueskyLengthLimitTests(unittest.TestCase):
     feature) still holds end-to-end for the new, potentially
     longer/differently-shaped verdict-style captions."""
 
-    @patch("deal_bot.requests.post")
-    @patch("deal_bot._build_bluesky_embed", return_value=None)
-    @patch("deal_bot._bluesky_login")
-    @patch("deal_bot.build_ai_caption")
+    @patch("deal_bot.integrations.bluesky.requests.post")
+    @patch("deal_bot.integrations.bluesky._build_bluesky_embed", return_value=None)
+    @patch("deal_bot.integrations.bluesky._bluesky_login")
+    @patch("deal_bot.integrations.bluesky.build_ai_caption")
     def test_post_text_never_exceeds_300_chars_even_with_an_oversized_caption(
         self, mock_caption, mock_login, mock_embed, mock_post
     ):
@@ -143,7 +145,7 @@ class BlueskyLengthLimitTests(unittest.TestCase):
         mock_post.return_value = Mock(status_code=200)
 
         deal = _make_deal(url="https://example.com/deal")
-        ok = db.post_to_bluesky(deal)
+        ok = bluesky.post_to_bluesky(deal)
 
         self.assertTrue(ok)
         sent_record = mock_post.call_args.kwargs["json"]["record"]

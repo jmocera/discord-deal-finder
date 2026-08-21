@@ -30,9 +30,9 @@ jobs:
       # That's the failure mode run_log/RUN_LOG_WEBHOOK_URL exist to
       # prevent: an unattended pipeline going quiet with nothing to
       # notice except the absence of activity.
-      - name: Run deal_bot.py
+      - name: Run deal_bot
         if: always()
-        run: python deal_bot.py
+        run: python -m deal_bot
         env:
           WOOT_API_KEY: ${{ secrets.WOOT_API_KEY }}
           BESTBUY_API_KEY: ${{ secrets.BESTBUY_API_KEY }}
@@ -45,12 +45,19 @@ jobs:
           DIGEST_WEBHOOK_URL: ${{ secrets.DIGEST_WEBHOOK_URL }}
           RUN_LOG_WEBHOOK_URL: ${{ secrets.RUN_LOG_WEBHOOK_URL }}
           SHADOW_CLASSIFIER_WEBHOOK_URL: ${{ secrets.SHADOW_CLASSIFIER_WEBHOOK_URL }}
+          SHADOW_QUALITY_SCORER_WEBHOOK_URL: ${{ secrets.SHADOW_QUALITY_SCORER_WEBHOOK_URL }}
+          SHADOW_CATEGORIZER_WEBHOOK_URL: ${{ secrets.SHADOW_CATEGORIZER_WEBHOOK_URL }}
           BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
           BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENROUTER_PRIMARY_MODEL: ${{ vars.OPENROUTER_PRIMARY_MODEL }}
           OPENROUTER_FALLBACK_MODEL: ${{ vars.OPENROUTER_FALLBACK_MODEL }}
           OPENROUTER_SPEC_EXTRACTION_MODEL: ${{ vars.OPENROUTER_SPEC_EXTRACTION_MODEL }}
+          OPENROUTER_SPEC_FALLBACK_MODEL: ${{ vars.OPENROUTER_SPEC_FALLBACK_MODEL }}
+          OPENROUTER_QUALITY_SCORER_MODEL: ${{ vars.OPENROUTER_QUALITY_SCORER_MODEL }}
+          OPENROUTER_QUALITY_SCORER_FALLBACK_MODEL: ${{ vars.OPENROUTER_QUALITY_SCORER_FALLBACK_MODEL }}
+          OPENROUTER_CATEGORIZER_MODEL: ${{ vars.OPENROUTER_CATEGORIZER_MODEL }}
+          OPENROUTER_CATEGORIZER_FALLBACK_MODEL: ${{ vars.OPENROUTER_CATEGORIZER_FALLBACK_MODEL }}
           # Plain tuning numbers, not credentials — repo Variables (not
           # Secrets) so they stay visible/editable via Settings -> Secrets
           # and variables -> Actions -> Variables instead of being
@@ -61,3 +68,4 @@ jobs:
           BLUESKY_MAX_POSTS_PER_RUN: ${{ vars.BLUESKY_MAX_POSTS_PER_RUN }}
           PRICE_HISTORY_MIN_DAYS: ${{ vars.PRICE_HISTORY_MIN_DAYS }}
           PRICE_HISTORY_TOLERANCE_PERCENT: ${{ vars.PRICE_HISTORY_TOLERANCE_PERCENT }}
+          MIN_QUALITY_SCORE: ${{ vars.MIN_QUALITY_SCORE }}

@@ -1,0 +1,1 @@
+"""Supabase-backed state: seen-deal dedupe, price history, and run log."""

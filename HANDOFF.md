@@ -1,7 +1,8 @@
 # deal-bot — Project Handoff
 
-Last updated: 2026-08-16 — added spec extraction, the caption "verdict"
-upgrade, and CI test wiring since the previous update.
+Last updated: 2026-08-21 — refactored the single-file `deal_bot.py` into a
+`deal_bot/` package and swapped the AI model lineup (Qwen spec extraction,
+Nemotron caption fallback) since the previous update.
 
 See also `VoltDrop_Project_Scope.md` in this repo for a narrative,
 higher-level overview of the same project — this document stays the deep
@@ -17,16 +18,15 @@ no local process to keep alive.
 
 **Repo**: https://github.com/jmocera/discord-deal-finder (private, owner: jmocera)
 **Local clone**: `C:\Users\johnm\Documents\deal-bot\`
-**Entry point**: `deal_bot.py` — a single file, deliberately not split into
-modules yet; read its own module docstring for a condensed version of this
-same context.
+**Entry point**: `python -m deal_bot` (the `deal_bot/` package; `__main__.py`
+delegates to `deal_bot/pipeline.py:main`). There is no top-level `deal_bot.py`
+anymore — a module file of that name would shadow the package on import.
+Package layout: `config.py` (env/constants), `sources/`, `storage/`,
+`integrations/`, `ai/`, and `pipeline.py` (the orchestrator).
 
-Two other files in `C:\Users\johnm\Documents\` are **not** part of this
-project and can be ignored/are superseded:
-- `deal_bot.py` — the original, very first version, never modified after
-  this project's `deal-bot/deal_bot.py` was created. Not deployed anywhere.
-- `deal_bot_dev.py` — an intermediate dev-iteration copy used for local
-  experimentation before this repo existed. Fully superseded.
+The now-deleted files from earlier iterations are superseded:
+- `deal_bot.py` — the original monolith; split into the `deal_bot/` package.
+- `deal_bot_dev.py` — an intermediate dev-iteration copy; fully superseded.
 
 ## How it runs
 
@@ -71,8 +71,16 @@ handed to the user as SQL to run in Supabase's SQL editor.
   `skipped_already_seen`, `skipped_no_better_price`,
   `skipped_below_threshold`, `skipped_not_near_historical_low`,
   `digest_sent` (bool), `error` (text, null on success).
+- `posted_deals` — append-only log of every deal that actually posted
+  (`id` text pk, `source`, `title`, `url`, `sale_price`, `list_price`,
+  `posted_at` timestamptz default `now()`), written by
+  `record_posted_deal()` after each successful post. Backs the weekly
+  digest (`weekly_digest.py`). **Not yet created** — the `CREATE TABLE`
+  statement lives in `deal_bot/weekly_digest.py`; run it in the SQL editor
+  before the weekly digest has anything to read. Until then
+  `record_posted_deal()` fails silently (404 → print) and the digest skips.
 
-## Discord channels (7 webhooks)
+## Discord channels (7 webhooks, plus 2 optional shadow channels)
 
 All currently point at **dev/test channels**, not production, on purpose —
 decision was to validate everything there first, then flip those channels'
@@ -90,6 +98,8 @@ setting change, not a code change.
 | `RUN_LOG_WEBHOOK_URL` | Status embed **every** run, success or failure — the main "is it actually working" channel to check |
 | `PRIVATE_WEBHOOK_URL` | Mirrors every posted deal as an embed + AI-written copy-paste caption (for manual X posting). This is the user's original pre-existing private channel, reused. |
 | `SHADOW_CLASSIFIER_WEBHOOK_URL` | Reports the desirability classifier's KEEP/DROP judgments — observation only, doesn't affect real posting (see below) |
+| `SHADOW_QUALITY_SCORER_WEBHOOK_URL` | Reports the deal quality scorer's 1-10 ratings — observation only (not yet created; feature stays off until set) |
+| `SHADOW_CATEGORIZER_WEBHOOK_URL` | Reports the category tagger's per-deal classification — observation only (not yet created; feature stays off until set) |
 
 ## Bluesky
 
@@ -128,8 +138,9 @@ free-tier fallback).
 
 - `OPENROUTER_API_KEY` — secret.
 - `OPENROUTER_PRIMARY_MODEL` — variable, currently `deepseek/deepseek-v4-flash-0731` (paid, very cheap: $0.09/M prompt, $0.18/M completion tokens).
-- `OPENROUTER_FALLBACK_MODEL` — variable, currently `openai/gpt-oss-20b:free`.
-- `OPENROUTER_SPEC_EXTRACTION_MODEL` — variable, currently `google/gemini-2.5-flash-lite`. Used only by spec extraction (below) — a separate model from the caption/classifier pair above.
+- `OPENROUTER_FALLBACK_MODEL` — variable, currently `nvidia/nemotron-3-ultra-550b-a55b:free` (caption/classifier free fallback).
+- `OPENROUTER_SPEC_EXTRACTION_MODEL` — variable, currently `qwen/qwen3.7-flash` ($0.03/$0.13 per M).
+- `OPENROUTER_SPEC_FALLBACK_MODEL` — variable, currently `google/gemini-2.5-flash-lite` (spec-extraction fallback, only called when the primary fails).
 - **Reasoning-effort handling is model-specific, not a fixed rule** — this
   mattered in practice three separate times (see "Bugs fixed"). The
   caption/classifier models need `reasoning: {"effort": "low"}` explicitly
@@ -140,6 +151,38 @@ free-tier fallback).
   opt-in per call for exactly this reason — don't assume one config works
   for a model without testing it.
 
+**Spec-extraction model history (2026-08-21):** switched from
+`google/gemini-2.5-flash-lite` to `qwen/qwen3.7-flash` (3x cheaper, validated
+against real titles). `xiaomi/mimo-v2.5` was tested as the fallback and
+rejected — it is a verbose reasoning model that spent its entire token budget
+on internal reasoning and returned null content on complex titles under every
+config (`effort: low`, `enabled: false`, `max_tokens` up to 1200). Gemini was
+kept as the fallback for that reason.
+
+**New AI features (2026-08-21) — all shadow-mode or additive, none gate real
+posts yet:**
+
+- **Deal quality scorer** (`ai/deal_scorer.py`) — one batched call per run
+  rating each posted deal 1-10 (free `google/gemma-4-26b-a4b-it:free`, paid
+  Gemma fallback). Reports to `SHADOW_QUALITY_SCORER_WEBHOOK_URL`; would drop
+  deals below `MIN_QUALITY_SCORE` (6) but is **shadow mode only**.
+- **Deal analysis** (`ai/deal_analyst.py`) — a longer 2-3 sentence "why this
+  is noteworthy" block rendered in the Discord embed's "Analysis" field
+  (complements the short Bluesky caption). Same models as captions; fails
+  open to an empty string. Live already.
+- **Category tagger** (`ai/categorizer.py`) — one batched call tagging each
+  posted deal into storage/display/component/peripheral/game/other. Reports
+  to `SHADOW_CATEGORIZER_WEBHOOK_URL`; not yet used to gate or route.
+- **Weekly digest** (`weekly_digest.py` + `.github/workflows/weekly_digest.yml`)
+  — Mondays at noon UTC, reads the `posted_deals` table and has Gemma write a
+  roundup posted to `DIGEST_WEBHOOK_URL` + Bluesky. Requires the `posted_deals`
+  table (see Supabase section).
+
+**Gemma reasoning finding:** the scorer/categorizer/weekly-digest Gemma models
+need reasoning **omitted** (setting any effort burns their token budget) — the
+opposite of the caption/classifier models. Confirmed empirically; locked in
+by tests (`test_deal_scorer.py` / `test_categorizer.py`).
+
 **Captions — upgraded from marketing copy to data-backed "verdicts"
 (2026-08-16):** `build_ai_caption()` originally wrote generic engaging
 captions; it now writes 1-2 sentence analytical verdicts explaining *why*
@@ -149,8 +192,8 @@ real Supabase price-history context (`is_new_low` / `lowest_price`).
 Anti-hallucination instruction forbids stating any spec not explicitly
 given. Still a three-tier fallback: primary model → free fallback model →
 plain template (`build_x_caption()`) — must never be able to block a
-post. The exact prompt is in `deal_bot.py` around
-`OPENROUTER_CAPTION_SYSTEM_PROMPT` / `build_ai_caption()`.
+post. The exact prompt is in `deal_bot/config.py` around
+`OPENROUTER_CAPTION_SYSTEM_PROMPT` / `deal_bot/ai/captions.py:build_ai_caption()`.
 
 **Hashtags are deliberately *not* restricted to a fixed allow-list.** A
 stricter spec proposed a hard 2-tag allow-list (`#gaming`/`#pcgaming`
@@ -198,7 +241,7 @@ consistent runs. **Not yet tested on genuinely ambiguous/borderline
 items**, which is where low reasoning effort could plausibly matter more —
 flagged as worth doing before fully trusting the classifier.
 
-## Filtering / quality-gate logic (all in `deal_bot.py`)
+## Filtering / quality-gate logic (config in `deal_bot/config.py`, loop in `deal_bot/pipeline.py`)
 
 - `MIN_DISCOUNT_PERCENT` (20), `MIN_DOLLAR_SAVINGS` (10) — basic thresholds.
 - `WOOT_INCLUDE_KEYWORDS` / `WOOT_EXCLUDE_KEYWORDS` — title keyword allow/deny lists, Woot only.
@@ -380,8 +423,8 @@ gh secret list --repo jmocera/discord-deal-finder
 gh variable list --repo jmocera/discord-deal-finder
 ```
 
-Querying Supabase or OpenRouter directly for debugging: import `deal_bot`
-as a module (`sys.path.insert(0, r"C:\Users\johnm\Documents\deal-bot")`)
-and reuse its `_supabase_headers()` / `SUPABASE_URL` / `OPENROUTER_API_KEY`
-etc. rather than re-deriving connection details — this is the pattern used
-throughout this project's own test scripts.
+Querying Supabase or OpenRouter directly for debugging: import the `deal_bot`
+package (`sys.path.insert(0, r"C:\Users\johnm\Documents\deal-bot")`) and
+reuse `deal_bot.storage.supabase._supabase_headers()`, `deal_bot.config.SUPABASE_URL`,
+`deal_bot.config.OPENROUTER_API_KEY`, etc. rather than re-deriving connection
+details — this is the pattern used throughout this project's own test scripts.
