@@ -4,8 +4,6 @@ import argparse
 import time
 from datetime import datetime, timezone
 
-import requests
-
 from deal_bot import config, transport
 from deal_bot.ai.categorizer import categorize_deals
 from deal_bot.ai.classifier import classify_desirable_deals
@@ -65,11 +63,7 @@ def log_run(
         }
         headers = _supabase_headers()
         headers["Prefer"] = "return=minimal"
-        try:
-            resp = requests.post(url, headers=headers, json=[row], timeout=15)
-        except requests.RequestException as e:
-            print(f"[supabase] run_log insert failed: {e}")
-            resp = None
+        resp = transport.request("POST", url, headers=headers, json=[row])
         if resp is not None and resp.status_code not in (200, 201, 204):
             print(f"[supabase] run_log insert returned {resp.status_code}: {resp.text[:300]}")
 
@@ -90,6 +84,18 @@ def log_run(
 # ---------------------------------------------------------------------------
 def run_once() -> None:
     seen = load_seen()
+    if seen is None:
+        # A hard load failure means we can't trust dedupe state — running
+        # with an empty seen map would treat every deal as new and risk
+        # double-posting. Log and bail BEFORE fetching feeds so we don't
+        # waste source calls on a run that will abort anyway.
+        log_run(
+            deals_checked=0, posted=0, skipped_already_seen=0,
+            skipped_no_better_price=0, skipped_below_threshold=0,
+            skipped_not_near_historical_low=0, digest_sent=False,
+            error="load_seen failed (Supabase unreachable) — bailed to avoid double-posting",
+        )
+        return
     all_deals = []
     # Mutated in place by _process_deals rather than returned at the end —
     # if the loop raises partway through (after some deals already

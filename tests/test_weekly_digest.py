@@ -12,7 +12,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from deal_bot import config
+from deal_bot import config, transport
 from deal_bot import weekly_digest
 from deal_bot.storage import supabase
 
@@ -121,6 +121,22 @@ class SupabaseRequestRetryTests(unittest.TestCase):
         self.assertIsNotNone(resp)  # the 404 response is returned as-is
         self.assertEqual(mock_net.call_count, 1)
         mock_sleep.assert_not_called()
+
+    @patch("deal_bot.transport.time.sleep")
+    @patch("deal_bot.transport.requests.request")
+    def test_retry_after_is_capped(self, mock_net, mock_sleep):
+        # A huge Retry-After (e.g. 3600s) must be clamped so "bounded"
+        # backoff stays bounded.
+        resp429 = _resp(429)
+        resp429.headers = {"Retry-After": "3600"}
+        mock_net.side_effect = [resp429, _resp(200)]
+        with patch.object(config, "SUPABASE_URL", "https://x.supabase.co"), \
+             patch.object(config, "SUPABASE_SERVICE_KEY", "k"):
+            resp = weekly_digest._supabase_request("GET", "https://x.supabase.co/rest/v1/posted_deals")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(mock_net.call_count, 2)
+        slept = [c[0][0] for c in mock_sleep.call_args_list]
+        self.assertTrue(all(w <= transport.MAX_SLEEP_SECONDS for w in slept))
 
 
 class FetchRecentPostedTests(unittest.TestCase):

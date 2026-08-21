@@ -26,18 +26,59 @@ def _deal(**overrides) -> dict:
     return deal
 
 
+class RunOnceBailTests(unittest.TestCase):
+    """run_once must bail (log + return) when load_seen fails hard, WITHOUT
+    fetching any feeds — running on an empty seen map risks double-posts."""
+
+    @patch("deal_bot.pipeline.load_seen", return_value=None)
+    @patch("deal_bot.pipeline.log_run")
+    def test_load_seen_none_bails_and_logs(self, mock_log, mock_load):
+        with patch("deal_bot.pipeline.fetch_woot_feed") as mock_woot, \
+             patch("deal_bot.pipeline.fetch_steam_specials") as mock_steam:
+            pipeline.run_once()
+
+        mock_woot.assert_not_called()
+        mock_steam.assert_not_called()
+        self.assertEqual(mock_log.call_count, 1)
+        self.assertIn("load_seen failed", mock_log.call_args.kwargs["error"])
+
+    @patch("deal_bot.pipeline.time.sleep")
+    @patch("deal_bot.pipeline.load_seen", return_value={})
+    @patch("deal_bot.pipeline.log_run")
+    def test_empty_seen_proceeds_to_feeds(self, mock_log, mock_load, mock_sleep):
+        # {} means "no Supabase config / nothing seen" — not a failure, so the
+        # run proceeds to fetching feeds. time.sleep is mocked so the per-feed
+        # rate-limit sleeps don't slow the test.
+        with patch("deal_bot.pipeline.fetch_woot_feed", return_value=[]), \
+             patch("deal_bot.pipeline.fetch_bestbuy_search", return_value=[]), \
+             patch("deal_bot.pipeline.fetch_steam_specials", return_value=[]), \
+             patch("deal_bot.pipeline._process_deals"), \
+             patch("deal_bot.pipeline.record_price_observations"), \
+             patch("deal_bot.pipeline.get_price_history_stats_bulk", return_value={}):
+            pipeline.run_once()
+
+        self.assertEqual(mock_log.call_count, 1)  # a normal completion log_run
+
+
 class SkipReasonTests(unittest.TestCase):
     def setUp(self):
-        self._orig_min_pct = config.MIN_DISCOUNT_PERCENT
-        self._orig_min_usd = config.MIN_DOLLAR_SAVINGS
-        self._orig_days = config.PRICE_HISTORY_MIN_DAYS
-        self._orig_tol = config.PRICE_HISTORY_TOLERANCE_PERCENT
+        # Save originals and pin a deterministic baseline so the tests are
+        # independent of .env values AND of any config mutated by an earlier
+        # test module (tearDown restores exactly what setUp saved).
+        self._orig = (
+            config.MIN_DISCOUNT_PERCENT,
+            config.MIN_DOLLAR_SAVINGS,
+            config.PRICE_HISTORY_MIN_DAYS,
+            config.PRICE_HISTORY_TOLERANCE_PERCENT,
+        )
+        config.MIN_DISCOUNT_PERCENT = 20
+        config.MIN_DOLLAR_SAVINGS = 10
+        config.PRICE_HISTORY_MIN_DAYS = 3
+        config.PRICE_HISTORY_TOLERANCE_PERCENT = 5
 
     def tearDown(self):
-        config.MIN_DISCOUNT_PERCENT = self._orig_min_pct
-        config.MIN_DOLLAR_SAVINGS = self._orig_min_usd
-        config.PRICE_HISTORY_MIN_DAYS = self._orig_days
-        config.PRICE_HISTORY_TOLERANCE_PERCENT = self._orig_tol
+        (config.MIN_DISCOUNT_PERCENT, config.MIN_DOLLAR_SAVINGS,
+         config.PRICE_HISTORY_MIN_DAYS, config.PRICE_HISTORY_TOLERANCE_PERCENT) = self._orig
 
     def test_new_deal_passes(self):
         self.assertIsNone(pipeline._skip_reason(_deal(), None, 0, None))

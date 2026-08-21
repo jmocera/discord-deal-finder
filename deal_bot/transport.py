@@ -25,6 +25,9 @@ import requests
 RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 MAX_ATTEMPTS = 3
 BACKOFF_SECONDS = (1.0, 2.0)  # sleep between attempts 1->2, 2->3
+# Hard cap on a single backoff sleep, even when the upstream asks for longer
+# via Retry-After — "bounded" backoff means the retry loop finishes promptly.
+MAX_SLEEP_SECONDS = 30.0
 
 
 def request(
@@ -46,7 +49,7 @@ def request(
             if attempt == attempts:
                 return None
             _log_retry(method, url, attempt, attempts, error=e)
-            time.sleep(base_sleep[attempt - 1])
+            time.sleep(_sleep_for(base_sleep, attempt))
             continue
 
         if resp.status_code not in retryable:
@@ -54,18 +57,22 @@ def request(
         if attempt == attempts:
             return resp
 
-        wait = base_sleep[attempt - 1]
+        wait = _sleep_for(base_sleep, attempt)
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
             if retry_after:
                 try:
-                    wait = max(wait, float(retry_after))
+                    wait = min(max(wait, float(retry_after)), MAX_SLEEP_SECONDS)
                 except ValueError:
                     pass
         _log_retry(method, url, attempt, attempts, status=resp.status_code)
         time.sleep(wait)
 
-    return None
+
+def _sleep_for(base_sleep: tuple[float, ...], attempt: int) -> float:
+    """Backoff for a given attempt, safe for any attempts count — falls back
+    to the last configured value beyond the configured pairs."""
+    return base_sleep[min(attempt - 1, len(base_sleep) - 1)]
 
 
 def _log_retry(method: str, url: str, attempt: int, total: int, *, status: int | None = None, error: Exception | None = None) -> None:

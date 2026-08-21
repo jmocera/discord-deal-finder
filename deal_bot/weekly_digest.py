@@ -36,6 +36,8 @@ import argparse
 import sys
 from datetime import datetime, timedelta, timezone
 
+import requests
+
 from deal_bot import config, transport
 from deal_bot.ai.client import _call_openrouter
 from deal_bot.integrations.bluesky import post_text_to_bluesky
@@ -45,7 +47,7 @@ from deal_bot.storage.supabase import _supabase_headers
 _PRUNE_DAYS = 90  # posted_deals older than this are deleted each run
 
 
-def _supabase_request(method: str, url: str, *, json=None, params=None, headers=None, timeout: int = 15):
+def _supabase_request(method: str, url: str, *, json=None, params=None, headers=None, timeout: int = 15) -> requests.Response | None:
     """Supabase request via the shared transport, merging the service-role
     auth headers. Retry/backoff policy lives in deal_bot.transport (single
     source of truth) — this is just the Supabase-specific header wrapper."""

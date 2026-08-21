@@ -8,7 +8,6 @@ model-specific gotchas live in exactly one place.
 import re
 
 from deal_bot import config, transport
-from deal_bot.transport import request as _request
 
 
 def _call_openrouter(
