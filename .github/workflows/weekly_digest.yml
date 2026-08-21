@@ -5,7 +5,12 @@ name: weekly-digest
     # Mondays at noon UTC — a once-a-week curated roundup of the week's
     # posted deals, distinct from the 4-hourly deal-bot schedule.
     - cron: "0 12 * * 1"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      no_bluesky:
+        description: "Skip the Bluesky post (E2E testing)"
+        type: boolean
+        default: false
 
 jobs:
   digest:
@@ -21,7 +26,7 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Run weekly digest
-        run: python -m deal_bot.weekly_digest
+        run: python -m deal_bot.weekly_digest ${{ github.event_name == 'workflow_dispatch' && inputs.no_bluesky && '--no-bluesky' || '' }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}

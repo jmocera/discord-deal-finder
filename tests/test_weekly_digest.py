@@ -97,5 +97,99 @@ class RecordPostedDealTests(unittest.TestCase):
         mock_post.assert_called_once()
 
 
+class PrunePostedDealsTests(unittest.TestCase):
+    def test_no_supabase_config_is_a_noop(self):
+        with patch.object(config, "SUPABASE_URL", ""):
+            with patch("deal_bot.weekly_digest.requests.delete") as mock_delete:
+                weekly_digest.prune_posted_deals()
+                mock_delete.assert_not_called()
+
+    @patch("deal_bot.weekly_digest.requests.delete")
+    def test_prunes_with_cutoff(self, mock_delete):
+        resp = Mock()
+        resp.status_code = 204
+        mock_delete.return_value = resp
+        with patch.object(config, "SUPABASE_URL", "https://x.supabase.co"), \
+             patch.object(config, "SUPABASE_SERVICE_KEY", "k"):
+            weekly_digest.prune_posted_deals(ttl_days=90)
+        self.assertIn("posted_at", mock_delete.call_args.kwargs["params"])
+
+
+class SeedClearPostedDealsTests(unittest.TestCase):
+    def test_seed_no_supabase_config_does_nothing(self):
+        with patch.object(config, "SUPABASE_URL", ""):
+            with patch("deal_bot.weekly_digest.requests.post") as mock_post:
+                weekly_digest.seed_posted_deals(3)
+                mock_post.assert_not_called()
+
+    @patch("deal_bot.weekly_digest.requests.post")
+    def test_seed_posts_rows(self, mock_post):
+        resp = Mock()
+        resp.status_code = 201
+        mock_post.return_value = resp
+        with patch.object(config, "SUPABASE_URL", "https://x.supabase.co"), \
+             patch.object(config, "SUPABASE_SERVICE_KEY", "k"):
+            weekly_digest.seed_posted_deals(3)
+        sent = mock_post.call_args.kwargs["json"]
+        self.assertEqual(len(sent), 3)
+        self.assertTrue(all(r["id"].startswith("seed:") for r in sent))
+
+    def test_clear_no_supabase_config_does_nothing(self):
+        with patch.object(config, "SUPABASE_URL", ""):
+            with patch("deal_bot.weekly_digest.requests.delete") as mock_delete:
+                weekly_digest.clear_posted_deals()
+                mock_delete.assert_not_called()
+
+    @patch("deal_bot.weekly_digest.requests.delete")
+    def test_clear_deletes_all(self, mock_delete):
+        resp = Mock()
+        resp.status_code = 204
+        mock_delete.return_value = resp
+        with patch.object(config, "SUPABASE_URL", "https://x.supabase.co"), \
+             patch.object(config, "SUPABASE_SERVICE_KEY", "k"):
+            weekly_digest.clear_posted_deals()
+        mock_delete.assert_called_once()
+
+
+class RunWeeklyDigestTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_key = config.OPENROUTER_API_KEY
+        config.OPENROUTER_API_KEY = "test-key"
+
+    def tearDown(self):
+        config.OPENROUTER_API_KEY = self._orig_key
+
+    @patch("deal_bot.weekly_digest._call_openrouter")
+    @patch("deal_bot.weekly_digest.fetch_recent_posted")
+    def test_dry_run_does_not_post(self, mock_fetch, mock_call):
+        mock_fetch.return_value = [_posted(1)]
+        mock_call.return_value = "Some roundup text."
+
+        with patch("deal_bot.weekly_digest._post_webhook") as mock_webhook, \
+             patch("deal_bot.weekly_digest.post_text_to_bluesky") as mock_bsky:
+            result = weekly_digest.run_weekly_digest(dry_run=True)
+
+        self.assertTrue(result)
+        mock_webhook.assert_not_called()
+        mock_bsky.assert_not_called()
+
+    @patch("deal_bot.weekly_digest._call_openrouter")
+    @patch("deal_bot.weekly_digest.fetch_recent_posted")
+    def test_skip_bluesky_skips_only_bluesky(self, mock_fetch, mock_call):
+        mock_fetch.return_value = [_posted(1)]
+        mock_call.return_value = "Some roundup text."
+
+        with patch("deal_bot.weekly_digest._post_webhook") as mock_webhook, \
+             patch("deal_bot.weekly_digest.post_text_to_bluesky") as mock_bsky:
+            with patch.object(config, "DIGEST_WEBHOOK_URL", "https://discord/x"), \
+                 patch.object(config, "BLUESKY_HANDLE", "h"), \
+                 patch.object(config, "BLUESKY_APP_PASSWORD", "p"):
+                result = weekly_digest.run_weekly_digest(skip_bluesky=True)
+
+        self.assertTrue(result)
+        mock_webhook.assert_called_once()
+        mock_bsky.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
