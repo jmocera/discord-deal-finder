@@ -17,9 +17,10 @@ One-time setup — run this in the Supabase SQL editor before the first run:
       posted_at timestamptz default now()
     );
 
-Until that table exists, the pipeline's `record_posted_deal` fails silently
-and this script's `fetch_recent_posted` returns an empty list, so nothing
-breaks — the digest just has nothing to say.
+Until that table exists, the pipeline's `record_posted_deal` fails silently.
+This script treats a missing table (or any non-200 fetch) as a hard failure —
+it exits non-zero so the scheduled workflow turns red rather than silently
+skipping. A week with no posted deals is still a healthy skip (exit 0).
 
 CLI (mostly for testing the digest end-to-end safely):
 
@@ -32,6 +33,8 @@ CLI (mostly for testing the digest end-to-end safely):
 """
 
 import argparse
+import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -44,8 +47,57 @@ from deal_bot.storage.supabase import _supabase_headers
 
 _PRUNE_DAYS = 90  # posted_deals older than this are deleted each run
 
+# Status codes that warrant a retry (transient upstream/Supabase blips).
+_RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_MAX_ATTEMPTS = 3
+_BACKOFF_SECONDS = (1.0, 2.0)  # sleep between attempts 1->2, 2->3
 
-def fetch_recent_posted(days: int = 7, limit: int | None = None) -> list[dict]:
+
+def _supabase_request(method: str, url: str, *, json=None, params=None, headers=None, timeout: int = 15) -> requests.Response | None:
+    """Issue a Supabase REST call with bounded retry on transient failures.
+
+    Retries network errors (RequestException) and retryable status codes
+    ({408, 425, 429, 500, 502, 503, 504}) with backoff, honoring
+    Retry-After on 429. Permanent 4xx responses (400/401/404) fail
+    immediately — they'd never succeed on retry. Returns the last Response,
+    or None only after exhausting all network-error retries."""
+    req_headers = _supabase_headers()
+    if headers:
+        req_headers.update(headers)
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.request(method, url, headers=req_headers, json=json, params=params, timeout=timeout)
+        except requests.RequestException as e:
+            if attempt == _MAX_ATTEMPTS:
+                return None
+            print(f"[weekly] {method} failed (attempt {attempt}/{_MAX_ATTEMPTS}): {e}")
+            time.sleep(_BACKOFF_SECONDS[attempt - 1])
+            continue
+
+        if resp.status_code not in _RETRYABLE_STATUSES:
+            return resp
+        if attempt == _MAX_ATTEMPTS:
+            return resp
+
+        wait = _BACKOFF_SECONDS[attempt - 1]
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    wait = max(wait, float(retry_after))
+                except ValueError:
+                    pass
+        print(f"[weekly] {method} returned {resp.status_code} (attempt {attempt}/{_MAX_ATTEMPTS}), retrying in {wait:.1f}s")
+        time.sleep(wait)
+    return None
+
+
+def fetch_recent_posted(days: int = 7, limit: int | None = None) -> list[dict] | None:
+    """Return posted_deals from the last `days`, newest first (optionally
+    capped to `limit`). Returns None if the fetch failed (network exhausted
+    or a non-200, including a missing table) — distinct from [], which means
+    "no Supabase config" or "genuinely no rows in the window." A missing
+    table is now a real failure, not a silent skip."""
     if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_KEY:
         return []
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
@@ -57,14 +109,13 @@ def fetch_recent_posted(days: int = 7, limit: int | None = None) -> list[dict]:
     }
     if limit is not None and limit > 0:
         params["limit"] = str(limit)
-    try:
-        resp = requests.get(url, headers=_supabase_headers(), params=params, timeout=15)
-    except requests.RequestException as e:
-        print(f"[weekly] posted_deals fetch failed: {e}")
-        return []
+    resp = _supabase_request("GET", url, params=params)
+    if resp is None:
+        print("[weekly] posted_deals fetch failed after retries")
+        return None
     if resp.status_code != 200:
         print(f"[weekly] posted_deals fetch returned {resp.status_code}: {resp.text[:300]}")
-        return []
+        return None
     return resp.json()
 
 
@@ -75,12 +126,9 @@ def prune_posted_deals(ttl_days: int = _PRUNE_DAYS) -> None:
         return
     cutoff = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).isoformat()
     url = f"{config.SUPABASE_URL}/rest/v1/posted_deals"
-    try:
-        resp = requests.delete(
-            url, headers=_supabase_headers(), params={"posted_at": f"lt.{cutoff}"}, timeout=15
-        )
-    except requests.RequestException as e:
-        print(f"[weekly] posted_deals prune failed: {e}")
+    resp = _supabase_request("DELETE", url, params={"posted_at": f"lt.{cutoff}"})
+    if resp is None:
+        print("[weekly] posted_deals prune failed after retries")
         return
     if resp.status_code not in (200, 204):
         print(f"[weekly] posted_deals prune returned {resp.status_code}: {resp.text[:300]}")
@@ -112,10 +160,9 @@ def seed_posted_deals(count: int = 7) -> None:
             "sale_price": sale,
             "list_price": listed,
         })
-    try:
-        resp = requests.post(url, headers=headers, json=rows, timeout=15)
-    except requests.RequestException as e:
-        print(f"[weekly] seed failed: {e}")
+    resp = _supabase_request("POST", url, json=rows, headers=headers)
+    if resp is None:
+        print("[weekly] seed failed after retries")
         return
     if resp.status_code not in (200, 201, 204):
         print(f"[weekly] seed returned {resp.status_code}: {resp.text[:300]}")
@@ -131,12 +178,9 @@ def clear_posted_deals() -> None:
         print("[weekly] no Supabase config — nothing to clear")
         return
     url = f"{config.SUPABASE_URL}/rest/v1/posted_deals"
-    try:
-        resp = requests.delete(
-            url, headers=_supabase_headers(), params={"id": "like.seed:%"}, timeout=15
-        )
-    except requests.RequestException as e:
-        print(f"[weekly] clear failed: {e}")
+    resp = _supabase_request("DELETE", url, params={"id": "like.seed:%"})
+    if resp is None:
+        print("[weekly] clear failed after retries")
         return
     if resp.status_code not in (200, 204):
         print(f"[weekly] clear returned {resp.status_code}: {resp.text[:300]}")
@@ -174,14 +218,24 @@ def build_weekly_digest(deals: list[dict]) -> str:
     return ""
 
 
-def run_weekly_digest(days: int = 7, limit: int | None = None, dry_run: bool = False, skip_bluesky: bool = False) -> bool:
+def run_weekly_digest(days: int = 7, limit: int | None = None, dry_run: bool = False, skip_bluesky: bool = False) -> bool | None:
+    """Run the digest. Returns:
+    - None  — skipped (no posted deals in window, or no Supabase config); healthy.
+    - True  — delivered (Discord or Bluesky) or a dry-run preview; healthy.
+    - False — failed (fetch failed after retries, both Gemma models returned
+      nothing, or nothing was delivered anywhere); the caller should exit
+      non-zero so the workflow turns red."""
     deals = fetch_recent_posted(days=days, limit=limit)
+    if deals is None:
+        print("[weekly] posted_deals fetch failed — aborting run")
+        return False
     if not deals:
         print("[weekly] no posted deals in window — skipping digest")
-        return False
+        return None
 
     text = build_weekly_digest(deals)
     if not text:
+        print("[weekly] digest text unavailable — nothing to post")
         return False
 
     if dry_run:
@@ -191,22 +245,33 @@ def run_weekly_digest(days: int = 7, limit: int | None = None, dry_run: bool = F
         print("---")
         return True
 
-    sent_discord = False
+    delivered = False
     if config.DIGEST_WEBHOOK_URL:
         sent_discord = _post_webhook(
             config.DIGEST_WEBHOOK_URL, {"embeds": [build_weekly_digest_embed(text)]}, "weekly-digest"
         )
         print(f"[weekly] discord posted={sent_discord}")
+        delivered = delivered or sent_discord
     else:
         print("[weekly] discord skipped (no DIGEST_WEBHOOK_URL)")
 
     if not skip_bluesky and config.BLUESKY_HANDLE and config.BLUESKY_APP_PASSWORD:
         posted = post_text_to_bluesky(text)
         print(f"[weekly] bluesky posted={posted}")
+        delivered = delivered or posted
     else:
         print("[weekly] bluesky skipped (--no-bluesky or no credentials)")
 
-    return sent_discord
+    if not delivered:
+        print("[weekly] nothing was delivered to Discord or Bluesky")
+        return False
+    return True
+
+
+def _exit_code(result: bool | None) -> int:
+    """Map the digest result to a process exit code: 0 for healthy (delivered
+    or skipped), 1 only when the digest genuinely failed to get anything out."""
+    return 0 if result is not False else 1
 
 
 def main() -> None:
@@ -234,7 +299,8 @@ def main() -> None:
         # skipped there too (prune is a destructive DELETE).
         if not args.dry_run:
             prune_posted_deals()
-        run_weekly_digest(days=args.days, limit=args.limit, dry_run=args.dry_run, skip_bluesky=args.no_bluesky)
+        result = run_weekly_digest(days=args.days, limit=args.limit, dry_run=args.dry_run, skip_bluesky=args.no_bluesky)
+        sys.exit(_exit_code(result))
 
 
 if __name__ == "__main__":

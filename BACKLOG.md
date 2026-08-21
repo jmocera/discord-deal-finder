@@ -64,6 +64,13 @@ invisible lost deal).
   clear seeded rows. Live run surfaced and fixed the unbounded-DELETE issue.
 - **Pruning** — done: `prune_posted_deals()` deletes rows older than 90 days
   on each normal run, so the append-only `posted_deals` table stays bounded.
+- **Retry + exit-code hardening** — done: the digest's Supabase calls now go
+  through a shared `_supabase_request` helper (3 attempts, backoff, honors
+  Retry-After, no retry on permanent 4xx), and `main()` exits non-zero when
+  nothing was delivered (or the fetch/table failed) so a real Monday failure
+  turns the workflow red. A missing `posted_deals` table or non-200 fetch is
+  now a hard failure (was a silent skip); a week with no posted deals is
+  still a healthy exit 0.
 - **Per-run AI budget** — the digest makes one Gemma call; fine today, but if
   deal volume climbs, watch `timeout-minutes: 5` headroom.
 
