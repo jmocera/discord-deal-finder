@@ -123,7 +123,7 @@ def build_categorizer_embed(deals: list[dict], categories: dict[str, str], model
     """SHADOW MODE report — shows the category tagger's per-deal
     classification for this run's actual posts. Nothing was gated or routed."""
     fields = [
-        {"name": "Classified", "value": str(len(deals)), "inline": True},
+        {"name": "Classified", "value": f"{len(categories)}/{len(deals)}", "inline": True},
         {"name": "Model", "value": model_used, "inline": True},
     ]
     lines = [
@@ -195,11 +195,14 @@ def build_shadow_classification_embed(keep: list[dict], drop: list[dict], model_
 def build_quality_scorer_embed(deals: list[dict], scores: dict[str, int], model_used: str, threshold: int) -> dict:
     """SHADOW MODE report — shows the deal quality scorer's 1-10 ratings for
     this run's actual posts, and which it would have dropped for scoring
-    below `threshold`. Nothing was actually withheld."""
-    would_drop = sum(1 for d in deals if scores.get(d["id"], 10) < threshold)
+    below `threshold`. Nothing was actually withheld. Deals missing from
+    `scores` (model didn't rate them) render as '?' and are never counted
+    against the threshold."""
+    scored_ids = {d["id"] for d in deals if scores.get(d["id"]) is not None}
+    would_drop = sum(1 for d in deals if d["id"] in scored_ids and scores[d["id"]] < threshold)
 
     fields = [
-        {"name": "Scored", "value": str(len(deals)), "inline": True},
+        {"name": "Scored", "value": f"{len(scored_ids)}/{len(deals)}", "inline": True},
         {"name": "Would drop", "value": str(would_drop), "inline": True},
         {"name": "Threshold", "value": str(threshold), "inline": True},
         {"name": "Model", "value": model_used, "inline": True},

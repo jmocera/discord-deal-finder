@@ -69,6 +69,11 @@ BLUESKY_HANDLE = os.environ.get("BLUESKY_HANDLE", "")
 BLUESKY_APP_PASSWORD = os.environ.get("BLUESKY_APP_PASSWORD", "")
 BLUESKY_MIN_DISCOUNT_PERCENT = int(os.environ.get("BLUESKY_MIN_DISCOUNT_PERCENT", "50"))
 BLUESKY_MAX_POSTS_PER_RUN = int(os.environ.get("BLUESKY_MAX_POSTS_PER_RUN", "2"))
+# Bluesky's server-side post cap is 300 grapheme clusters. Code points are
+# always >= graphemes, so len()<=300 is strictly server-safe; BLUESKY_POST_MARGIN
+# is belt-and-suspenders against off-by-ones in the fit/reassemble arithmetic.
+BLUESKY_MAX_POST_LEN = int(os.environ.get("BLUESKY_MAX_POST_LEN", "300"))
+BLUESKY_POST_MARGIN = int(os.environ.get("BLUESKY_POST_MARGIN", "2"))
 
 # ---------------------------------------------------------------------------
 # OpenRouter — AI-written captions for Bluesky and the private-channel
@@ -85,7 +90,7 @@ Output ONLY the verdict text — no preamble, no explanation, no quotation marks
 
 Write exactly 1-2 concise sentences explaining *why* this deal is actually noteworthy — a real price-history signal (e.g. a genuine all-time low), real value-for-money given the specs you were given, or a specific use case those specs support. Take a direct, analytical, enthusiast tone. Do not use hype phrases like "insane deal," "don't miss out," or "act now." Never state a spec, benchmark number, or feature that wasn't explicitly given to you — if you don't have enough information to say something specific and true, keep it simple rather than inventing detail.
 
-Keep the entire output under 200 characters. End with 2 to 4 relevant, space-separated hashtags chosen specifically for this item — vary them based on what the deal actually is, don't reuse the same generic tags every time. Never include a URL or link.
+Keep the entire output under 140 characters (including hashtags). End with 2 to 4 relevant, space-separated hashtags chosen specifically for this item — vary them based on what the deal actually is, don't reuse the same generic tags every time. Never include a URL or link.
 
 Example, given a 2TB PCIe Gen4 NVMe SSD at a new all-time low of $79.99 (was $159.99):
 This is the lowest we've tracked this 2TB PCIe Gen4 drive — a genuine all-time low, not just a markdown. Fast NVMe storage at a real floor price. #PCBuild #SSDDeals #TechDeals"""

@@ -60,18 +60,20 @@ class CategorizeDealsTests(unittest.TestCase):
         self.assertEqual(mock_call.call_count, 2)
 
     @patch("deal_bot.ai.categorizer._call_openrouter")
-    def test_wrong_line_count_fails_open(self, mock_call):
+    def test_wrong_line_count_produces_partial_report(self, mock_call):
         mock_call.return_value = "storage\ncomponent"  # 2 lines for 3 deals
         categories, model = categorizer.categorize_deals([_make_deal(i) for i in (1, 2, 3)])
         self.assertEqual(categories, {})
         self.assertIsNone(model)
+        self.assertEqual(mock_call.call_count, 2)
 
     @patch("deal_bot.ai.categorizer._call_openrouter")
-    def test_invalid_category_fails_open(self, mock_call):
+    def test_invalid_category_skipped_in_partial_report(self, mock_call):
         mock_call.return_value = "storage\ntoaster"  # not a known category
         categories, model = categorizer.categorize_deals([_make_deal(i) for i in (1, 2)])
         self.assertEqual(categories, {})
         self.assertIsNone(model)
+        self.assertEqual(mock_call.call_count, 2)
 
     @patch("deal_bot.ai.categorizer._call_openrouter")
     def test_prompt_carries_the_deals(self, mock_call):
@@ -89,6 +91,109 @@ class CategorizeDealsTests(unittest.TestCase):
         mock_call.return_value = "storage"
         categorizer.categorize_deals([_make_deal(1)])
         self.assertNotIn("reasoning", mock_call.call_args.kwargs)
+
+
+class LenientParseTests(unittest.TestCase):
+    """The strict per-line parse voids the whole report on any stray text
+    (real Gemma behavior). The lenient line-anchored regex fallback
+    salvages a report only when it yields EXACTLY len(deals) clean
+    category lines — partial salvage is intentionally removed so a
+    response can never silently mislabel a deal."""
+
+    def setUp(self):
+        self._orig_key = config.OPENROUTER_API_KEY
+        config.OPENROUTER_API_KEY = "test-key"
+
+    def tearDown(self):
+        config.OPENROUTER_API_KEY = self._orig_key
+
+    @patch("deal_bot.ai.categorizer._call_openrouter")
+    def test_preamble_narration_is_ignored(self, mock_call):
+        mock_call.return_value = "My classifications:\nstorage\ncomponent\ngame\nDone."
+        deals = [_make_deal(i) for i in (1, 2, 3)]
+
+        categories, model = categorizer.categorize_deals(deals)
+
+        self.assertEqual(model, config.OPENROUTER_CATEGORIZER_MODEL)
+        self.assertEqual(categories, {"woot:test-1": "storage", "woot:test-2": "component", "woot:test-3": "game"})
+
+    @patch("deal_bot.ai.categorizer._call_openrouter")
+    def test_markdown_bullets_are_handled(self, mock_call):
+        mock_call.return_value = "- storage\n- component\n- peripheral"
+        deals = [_make_deal(i) for i in (1, 2, 3)]
+
+        categories, model = categorizer.categorize_deals(deals)
+
+        self.assertEqual(categories, {"woot:test-1": "storage", "woot:test-2": "component", "woot:test-3": "peripheral"})
+
+    @patch("deal_bot.ai.categorizer._call_openrouter")
+    def test_case_insensitive_and_whitespace(self, mock_call):
+        mock_call.return_value = "STORAGE  \nComponent\n   game   "
+        deals = [_make_deal(i) for i in (1, 2, 3)]
+
+        categories, model = categorizer.categorize_deals(deals)
+
+        self.assertEqual(categories, {"woot:test-1": "storage", "woot:test-2": "component", "woot:test-3": "game"})
+
+    @patch("deal_bot.ai.categorizer._call_openrouter")
+    def test_partial_categories_produce_partial_map(self, mock_call):
+        mock_call.return_value = "storage only really sure about this one"
+        deals = [_make_deal(i) for i in (1, 2, 3)]
+
+        categories, model = categorizer.categorize_deals(deals)
+
+        self.assertEqual(categories, {})
+        self.assertIsNone(model)
+        self.assertEqual(mock_call.call_count, 2)
+
+    @patch("deal_bot.ai.categorizer._call_openrouter")
+    def test_no_valid_category_falls_through_to_next_model(self, mock_call):
+        mock_call.side_effect = ["toaster fan lamp", "toaster fan lamp"]
+        deals = [_make_deal(i) for i in (1, 2, 3)]
+
+        categories, model = categorizer.categorize_deals(deals)
+
+        self.assertEqual(categories, {})
+        self.assertIsNone(model)
+        self.assertEqual(mock_call.call_count, 2)
+
+    @patch("deal_bot.ai.categorizer._call_openrouter")
+    def test_title_echo_narration_rejects(self, mock_call):
+        # The model echoed each deal's title back as the "category" line.
+        # The old greedy regex would lift `game` out of `Game Controller`,
+        # `storage` out of `storage device`, and `display` out of
+        # `the display`. The line-anchored regex rejects all three lines
+        # (none is a bare category word), so the run fails OPEN instead.
+        mock_call.return_value = "Game Controller\nstorage device\nthe display"
+        deals = [_make_deal(i) for i in (1, 2, 3)]
+
+        categories, model = categorizer.categorize_deals(deals)
+
+        self.assertEqual(categories, {})
+        self.assertIsNone(model)
+        self.assertEqual(mock_call.call_count, 2)
+
+    @patch("deal_bot.ai.categorizer._call_openrouter")
+    def test_numbered_category_lines_parse(self, mock_call):
+        mock_call.return_value = "1. storage\n2. component\n3. game"
+        deals = [_make_deal(i) for i in (1, 2, 3)]
+
+        categories, model = categorizer.categorize_deals(deals)
+
+        self.assertEqual(model, config.OPENROUTER_CATEGORIZER_MODEL)
+        self.assertEqual(categories, {
+            "woot:test-1": "storage", "woot:test-2": "component", "woot:test-3": "game",
+        })
+
+    def test_extract_categories_line_anchored(self):
+        # Case-insensitive match; bare, dashed, and numbered prefixes all
+        # accepted; contaminated lines (`Storage Device`, `games`) rejected.
+        self.assertEqual(
+            categorizer._extract_categories(
+                "Game\nStorage Device\ngames\n- display\n1. peripheral"
+            ),
+            ["game", "display", "peripheral"],
+        )
 
 
 if __name__ == "__main__":

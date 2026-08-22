@@ -320,6 +320,12 @@ class CopyFormattingTests(unittest.TestCase):
         self.assertTrue(text.startswith("#ad "))
         self.assertIn("https://www.amazon.com/dp/B08N5WRWNW?tag=voltdrop05-20", text)
 
+    def test_bluesky_copy_url_is_the_last_line_and_under_hard_target(self):
+        vetted = self._vetted(clean_title="X" * 400)
+        text = vet.format_bluesky_copy(vetted)
+        self.assertLessEqual(len(text), 298)
+        self.assertTrue(text.endswith("https://www.amazon.com/dp/B08N5WRWNW?tag=voltdrop05-20"))
+
 
 # ---------------------------------------------------------------------------
 # _call_openrouter — missing key, network errors, non-200, empty content,

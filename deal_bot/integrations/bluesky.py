@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 import requests
 
 from deal_bot import config
-from deal_bot.ai.captions import _HASHTAG_PATTERN, build_ai_caption
+from deal_bot.ai.captions import _HASHTAG_PATTERN, build_ai_caption_body
+from deal_bot.post_len import HARD_TARGET, fit_deal_post, truncate_to
 
 _bluesky_session = None  # cached for the duration of one run, avoids re-login per post
 
@@ -70,6 +71,12 @@ def _build_bluesky_embed(session: dict, deal: dict) -> dict | None:
         print(f"[bluesky] thumbnail skipped — unexpected content-type {content_type!r}")
         return None
 
+    # Bluesky's PDS blob cap is ~1MB — fail fast client-side rather than
+    # relying on the PDS to reject the upload (see the comment below).
+    if len(img_resp.content) > 1_000_000:
+        print(f"[bluesky] thumbnail skipped — {len(img_resp.content)} bytes exceeds the 1MB blob cap")
+        return None
+
     try:
         blob_resp = requests.post(
             "https://bsky.social/xrpc/com.atproto.repo.uploadBlob",
@@ -115,16 +122,13 @@ def post_to_bluesky(deal: dict) -> bool:
     if not session:
         return False
 
-    text = build_ai_caption(deal)  # AI-written when available, template on fallback
-    if len(text) > 300:  # Bluesky's post length limit
-        # Trim the caption body, not a blind tail-slice of the whole
-        # string — the URL sits on the last line, and slicing the whole
-        # thing could clip or remove it, silently breaking the link
-        # facet below for anything long enough to need truncating.
-        url_suffix = f"\n{deal['url']}"
-        body = text[:-len(url_suffix)] if text.endswith(url_suffix) else text
-        max_body_len = 300 - len(url_suffix) - 1  # -1 for the trailing "…"
-        text = body[:max_body_len] + "…" + url_suffix
+    # Body first (AI-written when available, template on fallback), then the
+    # URL appended by fit_deal_post, which keeps the whole post within the
+    # Bluesky limit AND preserves the trailing hashtag run by trimming the
+    # prose instead of tail-slicing the caption (the old inline 300-char
+    # slice below was exactly what chopped hashtags and added the "…").
+    caption = build_ai_caption_body(deal)
+    text = fit_deal_post(caption, deal["url"])
 
     record = {
         "$type": "app.bsky.feed.post",
@@ -138,6 +142,9 @@ def post_to_bluesky(deal: dict) -> bool:
     # what was happening). Byte offsets, not character offsets: facets
     # are defined over the UTF-8-encoded text, and this caption can
     # contain multi-byte characters (e.g. the em dash) before the URL.
+    # Note: facets are always computed on the FINAL fitted `text` — the
+    # only place the text changes is fit_deal_post, above, so these
+    # offsets can never go stale.
     facets = []
     url_bytes = deal["url"].encode("utf-8")
     text_bytes = text.encode("utf-8")
@@ -152,6 +159,8 @@ def post_to_bluesky(deal: dict) -> bool:
         facets.sort(key=lambda f: f["index"]["byteStart"])
         record["facets"] = facets
 
+    # Embed attempt is strictly LAST and must never affect the text/facets
+    # above — a None embed just omits the card, the post still goes out.
     embed = _build_bluesky_embed(session, deal)
     if embed:
         record["embed"] = embed
@@ -175,13 +184,12 @@ def post_to_bluesky(deal: dict) -> bool:
 
 def post_text_to_bluesky(text: str) -> bool:
     """Post plain text (e.g. the weekly digest) to Bluesky. Truncates to
-    300 chars. No link facet or embed — a digest has no single URL to link."""
+    the hard target. No link facet or embed — a digest has no single URL to link."""
     session = _bluesky_login()
     if not session:
         return False
 
-    if len(text) > 300:
-        text = text[:296] + "…"
+    text = truncate_to(text, HARD_TARGET)
 
     record = {
         "$type": "app.bsky.feed.post",

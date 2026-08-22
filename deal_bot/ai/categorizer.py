@@ -5,17 +5,42 @@ category (storage/display/component/peripheral/game/other), which could
 later drive per-category Discord channels or better hashtag targeting.
 """
 
+import re
+
 from deal_bot import config
 from deal_bot.ai.client import _call_openrouter
+
+_CATEGORY_LINE = re.compile(
+    r"(?im)^\s*(?:[-–—*•]\s+|\d+[.):]\s+)?("
+    + "|".join(re.escape(c) for c in config.DEAL_CATEGORIES)
+    + r")\s*$"
+)
+
+
+def _extract_categories(response: str) -> list[str]:
+    """Line-anchored known-category extraction. Each non-empty line must
+    contain *only* a category word (with optional bullet/numbered prefix);
+    any other content on the line rejects it. Matching is case-insensitive
+    (the `(?i)` flag); results are lowercased so the caller can compare
+    against `config.DEAL_CATEGORIES` verbatim.
+
+    Replaces the previous greedy word-boundary `findall`, which would lift
+    `game` out of `Game Controller` or `storage` out of `storage device`.
+    The caller now requires `len(extracted) == len(deals)`.
+    """
+    return [m.lower() for m in _CATEGORY_LINE.findall(response)]
 
 
 def categorize_deals(deals: list[dict]) -> tuple[dict[str, str], str | None]:
     """Returns ({deal_id: category}, model_used). One batched call, fail-open.
 
     Fails OPEN: on any failure (missing key, both models erroring, or a
-    response that doesn't parse cleanly) an empty map and None are returned
-    — the caller treats that as "no categories this run," never as a reason
-    to drop a deal.
+    response that cannot be parsed to exactly len(deals) line-anchored
+    category tokens) an empty map and None are returned — the caller
+    treats that as "no categories this run," never as a reason to drop a
+    deal. Partial salvage is intentionally removed: a response that
+    doesn't yield exactly one category per deal for every deal falls
+    through to the fallback model.
     """
     if not deals:
         return {}, None
@@ -40,11 +65,21 @@ def categorize_deals(deals: list[dict]) -> tuple[dict[str, str], str | None]:
         if not response:
             continue
 
+        # Strict path: one clean category per line, exactly len(deals) lines.
         categories = [line.strip().lower() for line in response.strip().splitlines() if line.strip()]
-        if len(categories) != len(deals) or any(c not in valid for c in categories):
-            print(f"[openrouter] categorizer response from {model} didn't parse cleanly — trying next")
-            continue
-        return {d["id"]: c for d, c in zip(deals, categories)}, model
+        if len(categories) == len(deals) and all(c in valid for c in categories):
+            return {d["id"]: c for d, c in zip(deals, categories)}, model
+
+        # Lenient path: line-anchored regex extraction. Accepts bullets,
+        # numbered prefixes, and case variants. Requires the extracted
+        # token count to EXACTLY equal len(deals) — no partial salvage.
+        extracted = _extract_categories(response)
+        if len(extracted) == len(deals):
+            return {d["id"]: c for d, c in zip(deals, extracted)}, model
+        print(
+            f"[openrouter] categorizer response from {model} yielded "
+            f"{len(extracted)} categories for {len(deals)} deals — trying next"
+        )
 
     print("[openrouter] categorizer unavailable from both models this run — no shadow report")
     return {}, None

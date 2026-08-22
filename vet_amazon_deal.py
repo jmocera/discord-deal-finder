@@ -48,6 +48,7 @@ import requests
 from dotenv import load_dotenv
 
 from deal_bot.ai.client import _call_openrouter
+from deal_bot.post_len import HARD_TARGET, fit_deal_post, truncate_to
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -349,18 +350,12 @@ def format_bluesky_copy(vetted: dict) -> str:
     pct = _discount_pct(vetted)
     pct_str = f", {pct}% off" if pct is not None else ""
     price_str = " ".join(price_bits)
-    text = f"#ad {title} — {price_str}{pct_str}".strip() if price_str else f"#ad {title}"
+    body = f"#ad {title} — {price_str}{pct_str}".strip() if price_str else f"#ad {title}"
 
     url = vetted.get("canonical_url")
     if url:
-        text += f"\n{url}"
-
-    if len(text) > 300:  # Bluesky's post length limit
-        url_suffix = f"\n{url}" if url else ""
-        head = text[: -len(url_suffix)] if url_suffix and text.endswith(url_suffix) else text
-        max_head_len = 300 - len(url_suffix) - 1  # -1 for the trailing "…"
-        text = head[:max_head_len] + "…" + url_suffix
-    return text
+        return fit_deal_post(body, url)
+    return truncate_to(body, HARD_TARGET)
 
 
 # ---------------------------------------------------------------------------
