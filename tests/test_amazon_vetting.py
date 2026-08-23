@@ -342,7 +342,7 @@ class OpenRouterCallTests(unittest.TestCase):
     def test_missing_api_key_skips_network_call(self):
         config.OPENROUTER_API_KEY = ""
         with patch("deal_bot.transport.request") as mock_post:
-            result = vet._call_openrouter("some-model", "system", "user")
+            result = vet.call_openrouter("some-model", "system", "user")
             mock_post.assert_not_called()
         self.assertIsNone(result)
 
@@ -351,32 +351,38 @@ class OpenRouterCallTests(unittest.TestCase):
         # transport.request returns None only after exhausting network retries
         # — the client's fail-open path for a hard network failure.
         mock_request.return_value = None
-        self.assertIsNone(vet._call_openrouter("some-model", "system", "user"))
+        self.assertIsNone(vet.call_openrouter("some-model", "system", "user"))
 
     @patch("deal_bot.transport.request")
     def test_http_500_returns_none(self, mock_post):
         mock_post.return_value = _mock_response(500, text="internal server error")
-        self.assertIsNone(vet._call_openrouter("some-model", "system", "user"))
+        self.assertIsNone(vet.call_openrouter("some-model", "system", "user"))
 
     @patch("deal_bot.transport.request")
     def test_empty_content_returns_none(self, mock_post):
         mock_post.return_value = _openrouter_response("")
-        self.assertIsNone(vet._call_openrouter("some-model", "system", "user"))
+        self.assertIsNone(vet.call_openrouter("some-model", "system", "user"))
 
     @patch("deal_bot.transport.request")
     def test_code_fence_wrapped_json_is_stripped(self, mock_post):
         mock_post.return_value = _openrouter_response('```json\n{"a": 1}\n```')
-        result = vet._call_openrouter("some-model", "system", "user")
+        result = vet.call_openrouter("some-model", "system", "user")
         self.assertEqual(result, '{"a": 1}')
 
     @patch("deal_bot.transport.request")
     def test_list_user_content_accepted_for_vision(self, mock_post):
         mock_post.return_value = _openrouter_response('{"ok": true}')
         content_blocks = [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}]
-        result = vet._call_openrouter("vision-model", "system", content_blocks)
+        result = vet.call_openrouter("vision-model", "system", content_blocks)
         self.assertEqual(result, '{"ok": true}')
         sent_payload = mock_post.call_args.kwargs["json"]
         self.assertEqual(sent_payload["messages"][1]["content"], content_blocks)
+
+    def test_public_alias_is_the_private_implementation(self):
+        # vet_amazon_deal.py imports the public alias; it must be the same
+        # function object the package internals and tests patch.
+        from deal_bot.ai import client as or_client
+        self.assertIs(vet.call_openrouter, or_client._call_openrouter)
 
 
 # ---------------------------------------------------------------------------

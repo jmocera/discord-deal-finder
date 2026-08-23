@@ -10,7 +10,23 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from deal_bot import config
 from deal_bot import post_len
+
+
+class HardTargetTests(unittest.TestCase):
+    def test_reads_config_at_call_time(self):
+        # The budget must be computed per call, not frozen at import —
+        # otherwise config monkeypatching (the project's test convention)
+        # silently has no effect.
+        orig = (config.BLUESKY_MAX_POST_LEN, config.BLUESKY_POST_MARGIN)
+        try:
+            config.BLUESKY_MAX_POST_LEN, config.BLUESKY_POST_MARGIN = 300, 2
+            self.assertEqual(post_len.hard_target(), 298)
+            config.BLUESKY_MAX_POST_LEN, config.BLUESKY_POST_MARGIN = 280, 5
+            self.assertEqual(post_len.hard_target(), 275)
+        finally:
+            config.BLUESKY_MAX_POST_LEN, config.BLUESKY_POST_MARGIN = orig
 
 
 class TruncateToTests(unittest.TestCase):
@@ -31,13 +47,13 @@ class TruncateToTests(unittest.TestCase):
 
 
 class CaptionBudgetTests(unittest.TestCase):
-    def test_budget_equals_297_minus_url_len(self):
+    def test_budget_equals_target_minus_one_minus_url_len(self):
         url = "https://www.amazon.com/dp/B08N5WRWNW?tag=voltdrop05-20"
-        self.assertEqual(post_len.caption_budget(url), 297 - len(url))
+        self.assertEqual(post_len.caption_budget(url), post_len.hard_target() - 1 - len(url))
 
     def test_budget_for_no_url_is_hard_target(self):
-        self.assertEqual(post_len.caption_budget(None), post_len.HARD_TARGET)
-        self.assertEqual(post_len.caption_budget(""), post_len.HARD_TARGET)
+        self.assertEqual(post_len.caption_budget(None), post_len.hard_target())
+        self.assertEqual(post_len.caption_budget(""), post_len.hard_target())
 
 
 class SplitHashtagBlockTests(unittest.TestCase):
@@ -73,6 +89,17 @@ class TrimProseTests(unittest.TestCase):
     def test_passthrough_when_enough_room(self):
         self.assertEqual(post_len._trim_prose("short", 300), "short")
 
+    def test_leading_hashtag_never_split_mid_token(self):
+        # The '#ad' FTC disclosure must survive or be dropped whole — never
+        # sliced into a partial token like "#a".
+        self.assertEqual(post_len._trim_prose("#ad A very long product title here", 3), "")
+        self.assertEqual(post_len._trim_prose("#ad A very long product title here", 2), "")
+
+    def test_leading_hashtag_kept_intact_when_it_fits(self):
+        out = post_len._trim_prose("#ad A very long product title here", 10)
+        self.assertTrue(out.startswith("#ad"))
+        self.assertLessEqual(len(out), 10)
+
 
 class FitDealPostTests(unittest.TestCase):
     def test_happy_path_no_ellipsis(self):
@@ -86,7 +113,7 @@ class FitDealPostTests(unittest.TestCase):
         url = "https://example.com/" + "x" * 160
         body = "A" * 300 + " #PCBuild #SSDDeals"
         out = post_len.fit_deal_post(body, url)
-        self.assertLessEqual(len(out), post_len.HARD_TARGET)
+        self.assertLessEqual(len(out), post_len.hard_target())
         self.assertTrue(out.endswith(url))
         self.assertIn("#PCBuild #SSDDeals", out)
         self.assertTrue(out.startswith("A"))
@@ -98,7 +125,7 @@ class FitDealPostTests(unittest.TestCase):
         url = "https://example.com/" + "y" * 274  # suffix = 296, one code point spare
         body = "A" * 300 + " #PCBuild #SSDDeals"
         out = post_len.fit_deal_post(body, url)
-        self.assertLessEqual(len(out), post_len.HARD_TARGET)
+        self.assertLessEqual(len(out), post_len.hard_target())
         self.assertTrue(out.endswith(url))
         self.assertNotIn("#SSDDeals", out)  # tags dropped, URL kept
 
@@ -112,21 +139,21 @@ class FitDealPostTests(unittest.TestCase):
             "A" * 400 + " #OnlyTag",
             "#PCBuild #SSDDeals",
         ):
-            self.assertLessEqual(len(post_len.fit_deal_post(body, url)), post_len.HARD_TARGET)
+            self.assertLessEqual(len(post_len.fit_deal_post(body, url)), post_len.hard_target())
 
     def test_no_url_truncates_body(self):
         out = post_len.fit_deal_post("B" * 500, None)
-        self.assertLessEqual(len(out), post_len.HARD_TARGET)
+        self.assertLessEqual(len(out), post_len.hard_target())
 
     def test_url_only_when_url_consumes_budget(self):
         # Degenerate: URL alone near the cap — must return the URL, not raise.
-        url = "https://example.com/" + "z" * (post_len.HARD_TARGET - 3)
+        url = "https://example.com/" + "z" * (post_len.hard_target() - 3)
         self.assertEqual(post_len.fit_deal_post("A" * 400, url), url)
 
     def test_single_token_caption(self):
         url = "https://example.com/deal"
         out = post_len.fit_deal_post("A" * 500, url)
-        self.assertLessEqual(len(out), post_len.HARD_TARGET)
+        self.assertLessEqual(len(out), post_len.hard_target())
         self.assertTrue(out.endswith(url))
 
 

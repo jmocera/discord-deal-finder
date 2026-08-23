@@ -3,9 +3,16 @@
 Every outbound HTTP call in the package routes through `request()`, so
 transient failures (network blips, 429/5xx) are retried once, in one place,
 instead of each caller re-implementing "try/except + print + return". This
-protects dedup correctness: a transient `load_seen`/`upsert_seen_entry`
+protects dedupe correctness: a transient `load_seen`/`upsert_seen_entry`
 failure no longer silently becomes an empty seen-map or a dropped write,
 either of which risks a double-post on the next run.
+
+Scope: Supabase storage, the OpenRouter client, run_log, the weekly digest,
+the watchdog, and the read-only source GETs (Woot/Best Buy/Steam). Discord
+webhook posts and Bluesky XRPC posts are deliberately OUT of this layer —
+they are non-idempotent POSTs whose auto-retry after a lost response would
+silently double-post a deal, so each carries its own bounded loop that
+retries only explicit rate-limit responses instead.
 
 Retry policy:
 - Retries network errors (requests.RequestException) and retryable statuses.

@@ -4,12 +4,14 @@ Best Buy's Products API is free but requires an API key that is still
 pending approval as of the latest HANDOFF — so this source contributes
 zero deals until `BESTBUY_API_KEY` is set. The query-encoding logic here
 has not yet been exercised against a real key.
+
+Read-only GET, so it goes through the shared transport (transient blips
+are retried instead of losing the whole feed for this run).
 """
 
-import requests
 from urllib.parse import quote
 
-from deal_bot import config
+from deal_bot import config, transport
 from deal_bot.sources.base import discount_percent
 
 
@@ -26,19 +28,24 @@ def fetch_bestbuy_search(term: str) -> list[dict]:
     if not config.BESTBUY_API_KEY:
         return []
     fields = "sku,name,salePrice,regularPrice,url,image,onSale"
-    query = quote(f"search={term}&onSale=true")
+    # Only the search term gets percent-encoded. The structural '&' and '='
+    # separators must stay literal — quoting the whole expression (the old
+    # behavior) turned it into one garbled literal the API can't parse.
+    query = f"search={quote(term)}&onSale=true"
     url = (
         f"https://api.bestbuy.com/v1/products({query})"
         f"?apiKey={config.BESTBUY_API_KEY}&format=json&show={fields}&pageSize=20"
     )
-    try:
-        resp = requests.get(url, timeout=15)
-    except requests.RequestException as e:
-        print(f"[bestbuy] request failed for term '{term}': {_redact(str(e))}")
+    # NOTE: deliberately passed as a pre-assembled URL string, NOT via
+    # params= — re-encoding would break the products(...) expression.
+    resp = transport.request("GET", url, timeout=15)
+
+    if resp is None:
+        print(f"[bestbuy] request failed for term '{term}' after retries")
         return []
 
     if resp.status_code != 200:
-        print(f"[bestbuy] search '{term}' returned {resp.status_code}: {resp.text[:300]}")
+        print(f"[bestbuy] search '{term}' returned {resp.status_code}: {_redact(resp.text[:300])}")
         return []
 
     products = resp.json().get("products", [])

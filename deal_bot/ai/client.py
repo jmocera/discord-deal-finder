@@ -82,3 +82,9 @@ def _call_openrouter(
     # single wrapping pair if present rather than rejecting the whole thing.
     content = content.strip('"').strip("'").strip()
     return content or None
+
+
+# Public alias for consumers OUTSIDE the deal_bot package (e.g. the
+# standalone vet_amazon_deal.py script) — internal package modules keep
+# importing the underscore name, and tests keep patching it.
+call_openrouter = _call_openrouter

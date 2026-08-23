@@ -40,6 +40,7 @@ import requests
 
 from deal_bot import config, transport
 from deal_bot.ai.client import _call_openrouter
+from deal_bot.display import price_str
 from deal_bot.integrations.bluesky import post_text_to_bluesky
 from deal_bot.integrations.discord import build_weekly_digest_embed, _post_webhook
 from deal_bot.storage.supabase import _supabase_headers
@@ -161,13 +162,12 @@ def build_weekly_digest(deals: list[dict]) -> str:
 
     lines = []
     for d in deals:
-        price = f"${d['sale_price']:.2f}"
+        price = price_str(d["sale_price"], d.get("list_price"))
         discount = ""
         if d.get("list_price"):
-            price += f" (was ${d['list_price']:.2f})"
             pct = round((d["list_price"] - d["sale_price"]) / d["list_price"] * 100, 1)
             discount = f" — {pct}% off"
-        lines.append(f"- [{d['source']}] {d['title']}{discount} — {price}")
+        lines.append(f"- [{d['source']}] {d['title']} — {price}{discount}")
     user_prompt = "\n".join(lines)
 
     for model in (config.OPENROUTER_WEEKLY_DIGEST_MODEL, config.OPENROUTER_WEEKLY_DIGEST_FALLBACK_MODEL):

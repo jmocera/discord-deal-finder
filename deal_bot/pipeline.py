@@ -167,6 +167,25 @@ def run_once() -> None:
         )
 
 
+def _enrich_with_price_history(deal: dict, prior: dict | None) -> None:
+    """Attach the price-history badge fields the embed/caption/analysis
+    prompts read. "Lowest seen" here means the lowest we've ever ALERTED on
+    (seen_deals), versus the item's true floor in price_history.
+
+    is_new_low is STRICT (<): merely matching the previous low is not a new
+    record. A tie takes the carry-forward branch, so the original
+    lowest_price_date is preserved rather than refreshed to today."""
+    prior_lowest = (prior or {}).get("lowest_price")
+    sale = deal["sale_price"]
+    deal["is_new_low"] = prior_lowest is not None and sale < prior_lowest
+    if prior_lowest is not None and prior_lowest <= sale:
+        deal["lowest_price"] = prior_lowest
+        deal["lowest_price_date"] = prior.get("lowest_price_date")
+    else:
+        deal["lowest_price"] = sale
+        deal["lowest_price_date"] = datetime.now(timezone.utc).isoformat()
+
+
 def _skip_reason(deal: dict, prior: dict | None, history_days: int, history_low: float | None) -> str | None:
     """The deterministic pre-post filter, factored out so the gate decisions
     are independently testable. Returns the stats key explaining WHY the deal
@@ -215,17 +234,9 @@ def _process_deals(
         if reason is not None:
             stats[reason] += 1
             continue
-        # Price-history tracking for the embed badge. "Lowest seen" here means
-        # the lowest we've ever alerted on (seen_deals), versus the item's true
-        # floor in price_history above.
-        prior_lowest = (prior or {}).get("lowest_price")
-        deal["is_new_low"] = prior_lowest is not None and deal["sale_price"] <= prior_lowest
-        if prior_lowest is not None and prior_lowest < deal["sale_price"]:
-            deal["lowest_price"] = prior_lowest
-            deal["lowest_price_date"] = prior.get("lowest_price_date")
-        else:
-            deal["lowest_price"] = deal["sale_price"]
-            deal["lowest_price_date"] = datetime.now(timezone.utc).isoformat()
+        # Price-history tracking for the embed badge (see the helper's
+        # docstring for the strict-new-low / tie-keeps-date semantics).
+        _enrich_with_price_history(deal, prior)
         candidates.append(deal)
 
     # ---- PHASE B — batched AI enrichment ----------------------------------
@@ -342,6 +353,8 @@ def _process_deals(
                 {"embeds": [build_categorizer_embed(posted_deals, categories, model_used)]},
                 "shadow-categorizer",
             )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--loop", action="store_true", help="keep running instead of a single pass (local testing only — GitHub Actions uses its own schedule)")

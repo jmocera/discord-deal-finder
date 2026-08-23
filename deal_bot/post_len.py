@@ -21,7 +21,13 @@ _HASHTAG_PATTERN = re.compile(r"#(\w+)")
 
 ELLIPSIS = "…"
 
-HARD_TARGET = config.BLUESKY_MAX_POST_LEN - config.BLUESKY_POST_MARGIN
+
+def hard_target() -> int:
+    """The code-point budget for one Bluesky post, read at call time so
+    tests (and operators via .env) can change config.BLUESKY_MAX_POST_LEN /
+    BLUESKY_POST_MARGIN without re-importing this module — same convention
+    as every other config consumer in the package."""
+    return config.BLUESKY_MAX_POST_LEN - config.BLUESKY_POST_MARGIN
 
 
 def grapheme_len(s: str) -> int:
@@ -80,8 +86,8 @@ def caption_budget(url: str | None) -> int:
     """Max caption-body length (code points) so body + newline + url still
     fits the hard target. The -1 accounts for the '\n' before the URL."""
     if not url:
-        return HARD_TARGET
-    return HARD_TARGET - 1 - len(url)
+        return hard_target()
+    return hard_target() - 1 - len(url)
 
 
 def fit_deal_post(body: str, url: str | None) -> str:
@@ -93,10 +99,10 @@ def fit_deal_post(body: str, url: str | None) -> str:
       3. Drop hashtags one-by-one (from the end) only as a last resort.
       4. Drop the ellipsis, then degrade to URL-only, then (never) raise.
 
-    Always returns a string of len() <= HARD_TARGET (code points), never
+    Always returns a string of len() <= hard_target() (code points), never
     empty, never raises.
     """
-    target = HARD_TARGET
+    target = hard_target()
     if not url:
         return truncate_to(body, target)
 
@@ -169,7 +175,8 @@ def _is_hashtag_block(token: str) -> bool:
 def _trim_prose(prose: str, n: int) -> str:
     """Trim prose to at most n code points, preferring word boundaries and
     never splitting a leading #hashtag token (e.g. the '#ad' disclosure
-    that must survive every post)."""
+    that must survive every post). If even that token can't fit intact,
+    returns "" rather than slicing it mid-token."""
     if n <= 0:
         return ""
     if len(prose) <= n:
@@ -177,8 +184,8 @@ def _trim_prose(prose: str, n: int) -> str:
     lead = re.match(r"#[A-Za-z0-9]+\s+", prose)
     if lead:
         prefix = lead.group(0)
-        if len(prefix) >= n:
-            return prefix[:n].rstrip()
+        if n <= len(prefix.rstrip()):
+            return ""  # can't fit the tag intact — drop the prose entirely
         return prefix + _trim_prose(prose[len(prefix):], n - len(prefix)).rstrip()
     cut = prose[:n].rstrip()
     space = cut.rfind(" ")

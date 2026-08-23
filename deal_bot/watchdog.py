@@ -21,11 +21,11 @@ from deal_bot.integrations.discord import _post_webhook
 from deal_bot.storage.supabase import _supabase_headers
 
 
-def fetch_last_run(max_hours: int = 6) -> datetime | None:
+def fetch_last_run() -> datetime | None:
     """Most recent run_log.ran_at, or None if the query failed or there's no
-    suspend/run at all. Uses the shared transport (bounded retry)."""
-    if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_KEY:
-        return None
+    run at all. Uses the shared transport (bounded retry). Callers treat
+    None as "cannot confirm freshness" — run_watchdog decides what that
+    means (stale → alert)."""
     url = f"{config.SUPABASE_URL}/rest/v1/run_log"
     resp = transport.request(
         "GET", url, headers=_supabase_headers(),
@@ -59,8 +59,16 @@ def _run_is_stale(last_run: datetime | None, max_hours: int) -> bool:
 
 def run_watchdog(max_hours: int = 6) -> bool:
     """Returns True if an alert was posted (or would have been, without a
-    configured webhook). Returns False when the last run is fresh."""
-    last_run = fetch_last_run(max_hours=max_hours)
+    configured webhook). Returns False when the last run is fresh — or when
+    there's no Supabase config at all: without DB access the watchdog can't
+    know anything, and a false "no run in 6h" alarm every hour would just
+    train the operator to ignore it (misconfiguration surfaces as loud
+    console output in the Actions log instead)."""
+    if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_KEY:
+        print("[watchdog] SUPABASE_URL / SUPABASE_SERVICE_KEY not set — nothing to check, skipping alert")
+        return False
+
+    last_run = fetch_last_run()
     if not _run_is_stale(last_run, max_hours):
         print(f"[watchdog] last run {last_run.isoformat()} is fresh — no alert")
         return False

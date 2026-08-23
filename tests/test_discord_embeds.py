@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deal_bot.integrations.discord import (
+    _join_capped,
     build_categorizer_embed,
     build_quality_scorer_embed,
 )
@@ -24,6 +25,69 @@ def _deal(i: int) -> dict:
         "url": f"https://example.com/deal/{i}", "sale_price": 10.0 * i,
         "list_price": 20.0 * i, "discount_pct": 50.0,
     }
+
+
+class JoinCappedTests(unittest.TestCase):
+    def test_short_lines_all_included_no_suffix(self):
+        lines = ["a", "bb", "ccc"]
+        self.assertEqual(_join_capped(lines), "a\nbb\nccc")
+
+    def test_empty_lines_give_empty_string(self):
+        self.assertEqual(_join_capped([]), "")
+
+    def test_overflow_drops_tail_and_appends_count(self):
+        lines = [f"line-{i} " + "x" * 60 for i in range(30)]
+        out = _join_capped(lines)
+        self.assertLessEqual(len(out), 1024)
+        self.assertTrue(out.startswith("line-0"))
+        self.assertIn("…and", out)
+        # The first dropped line's index is named in the notice.
+        dropped = next(l for l in lines if l not in out)
+        idx = int(dropped.split()[0].split("-")[1])
+        self.assertIn(str(30 - idx), out)
+
+    def test_never_exceeds_cap_for_any_input(self):
+        for n in (1, 5, 13, 14, 15, 20, 40):
+            lines = [f"[{'t' * 70}](https://example.com/{'u' * 100}) — Woot" for _ in range(n)]
+            self.assertLessEqual(len(_join_capped(lines)), 1024)
+
+    def test_single_giant_line_is_truncated_not_lost(self):
+        giant = "y" * 5000
+        out = _join_capped([giant])
+        self.assertEqual(len(out), 1024)
+        self.assertTrue(out.startswith("y"))
+
+
+class EmbedOverflowTests(unittest.TestCase):
+    """A big sale day (many posted deals) must not produce field values over
+    Discord's 1024-char limit — that used to make the whole shadow webhook
+    return 400 and silently lose the report."""
+
+    def test_categorizer_embed_field_within_limit(self):
+        deals = [_deal(i) for i in range(20)]
+        categories = {d["id"]: "storage" for d in deals}
+        embed = build_categorizer_embed(deals, categories, "m")
+        scores_field = next(f for f in embed["fields"] if f["name"] == "Categories")
+        self.assertLessEqual(len(scores_field["value"]), 1024)
+
+    def test_quality_scorer_embed_field_within_limit(self):
+        deals = [_deal(i) for i in range(20)]
+        scores = {d["id"]: 7 for d in deals}
+        embed = build_quality_scorer_embed(deals, scores, "m", 6)
+        scores_field = next(f for f in embed["fields"] if f["name"] == "Scores")
+        self.assertLessEqual(len(scores_field["value"]), 1024)
+
+    def test_shadow_classification_long_urls_stay_within_limit(self):
+        from deal_bot.integrations.discord import build_shadow_classification_embed
+        drop = []
+        for i in range(15):
+            d = _deal(i)
+            d["url"] = f"https://example.com/{'u' * 120}/{i}"  # long real-world URL
+            d["title"] = "T" * 70
+            drop.append(d)
+        embed = build_shadow_classification_embed([], drop, "m")
+        field = next(f for f in embed["fields"] if f["name"] == "Would have dropped")
+        self.assertLessEqual(len(field["value"]), 1024)
 
 
 class QualityScorerEmbedTests(unittest.TestCase):

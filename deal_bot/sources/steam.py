@@ -1,10 +1,12 @@
 """Steam deal source.
 
 Steam's public storefront "Specials" data — no API key needed, this is the
-same data that powers Steam's own front-page deals section.
+same data that powers Steam's own front-page deals section. Read-only GET,
+so it goes through the shared transport (transient blips are retried
+instead of losing the whole feed for this run).
 """
 
-import requests
+from deal_bot import transport
 
 
 def fetch_steam_specials() -> list[dict]:
@@ -14,10 +16,10 @@ def fetch_steam_specials() -> list[dict]:
     discounted game on the platform, so expect a modest, curated list
     rather than a huge catalog dump."""
     url = "https://store.steampowered.com/api/featuredcategories?cc=us&l=en"
-    try:
-        resp = requests.get(url, timeout=15)
-    except requests.RequestException as e:
-        print(f"[steam] request failed: {e}")
+    resp = transport.request("GET", url, timeout=15)
+
+    if resp is None:
+        print("[steam] request failed after retries")
         return []
 
     if resp.status_code != 200:

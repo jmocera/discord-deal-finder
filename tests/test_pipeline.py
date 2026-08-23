@@ -118,6 +118,42 @@ class SkipReasonTests(unittest.TestCase):
         self.assertIsNone(pipeline._skip_reason(_deal(), None, 1, 20.0))
 
 
+class EnrichPriceHistoryTests(unittest.TestCase):
+    """_enrich_with_price_history: strict new-low semantics. A TIE with the
+    previous low is NOT a new record and must keep the ORIGINAL
+    lowest_price_date instead of refreshing it."""
+
+    def _prior(self, lowest, date="2026-01-01T00:00:00+00:00"):
+        return {"sale_price": lowest, "lowest_price": lowest, "lowest_price_date": date}
+
+    def test_no_prior_establishes_floor(self):
+        deal = _deal(sale_price=50.0)
+        pipeline._enrich_with_price_history(deal, None)
+        self.assertFalse(deal["is_new_low"])
+        self.assertEqual(deal["lowest_price"], 50.0)
+        self.assertTrue(deal["lowest_price_date"])  # a timestamp got set
+
+    def test_strictly_lower_is_new_low(self):
+        deal = _deal(sale_price=50.0)
+        pipeline._enrich_with_price_history(deal, self._prior(55.0))
+        self.assertTrue(deal["is_new_low"])
+        self.assertEqual(deal["lowest_price"], 50.0)
+
+    def test_tie_keeps_original_date(self):
+        deal = _deal(sale_price=50.0)
+        pipeline._enrich_with_price_history(deal, self._prior(50.0))
+        self.assertFalse(deal["is_new_low"])
+        self.assertEqual(deal["lowest_price"], 50.0)
+        self.assertEqual(deal["lowest_price_date"], "2026-01-01T00:00:00+00:00")
+
+    def test_higher_than_prior_carries_forward(self):
+        deal = _deal(sale_price=55.0)
+        pipeline._enrich_with_price_history(deal, self._prior(45.0))
+        self.assertFalse(deal["is_new_low"])
+        self.assertEqual(deal["lowest_price"], 45.0)
+        self.assertEqual(deal["lowest_price_date"], "2026-01-01T00:00:00+00:00")
+
+
 class BatchSpecExtractionTests(unittest.TestCase):
     def setUp(self):
         self._orig_key = config.OPENROUTER_API_KEY

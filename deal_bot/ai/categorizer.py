@@ -10,11 +10,17 @@ import re
 from deal_bot import config
 from deal_bot.ai.client import _call_openrouter
 
-_CATEGORY_LINE = re.compile(
-    r"(?im)^\s*(?:[-–—*•]\s+|\d+[.):]\s+)?("
-    + "|".join(re.escape(c) for c in config.DEAL_CATEGORIES)
-    + r")\s*$"
-)
+
+def _category_line_pattern() -> re.Pattern:
+    """Built per call (not at import) from config.DEAL_CATEGORIES — same
+    call-time-config convention as the rest of the package, so a test (or
+    operator) mutating DEAL_CATEGORIES takes effect without re-importing.
+    Called at most twice per run; compile cost is negligible."""
+    return re.compile(
+        r"(?im)^\s*(?:[-–—*•]\s+|\d+[.):]\s+)?("
+        + "|".join(re.escape(c) for c in config.DEAL_CATEGORIES)
+        + r")\s*$"
+    )
 
 
 def _extract_categories(response: str) -> list[str]:
@@ -28,7 +34,7 @@ def _extract_categories(response: str) -> list[str]:
     `game` out of `Game Controller` or `storage` out of `storage device`.
     The caller now requires `len(extracted) == len(deals)`.
     """
-    return [m.lower() for m in _CATEGORY_LINE.findall(response)]
+    return [m.lower() for m in _category_line_pattern().findall(response)]
 
 
 def categorize_deals(deals: list[dict]) -> tuple[dict[str, str], str | None]:

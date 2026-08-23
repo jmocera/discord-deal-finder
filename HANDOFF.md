@@ -1,8 +1,12 @@
 # deal-bot — Project Handoff
 
-Last updated: 2026-08-21 — added the build-first reliability trio (shared
-retry/backoff transport, watchdog heartbeat, phased pipeline with batched AI)
-since the previous update; test suite is now 171 stdlib tests.
+Last updated: 2026-08-22 — full-project code-review hardening pass: six bug
+fixes (webhook non-JSON-429 crash, shadow-embed field overflow, Best Buy
+query encoding, Bluesky login-shape guard, watchdog false-alarm on missing
+config, stale posted_at on re-post), source GETs moved onto the shared
+transport, call-time config binding for post_len/categorizer, a shared
+display module for price/discount strings, and strict new-low semantics.
+Suite is now 277 stdlib tests, all passing.
 
 See also `VoltDrop_Project_Scope.md` in this repo for a narrative,
 higher-level overview of the same project — this document stays the deep
@@ -56,14 +60,19 @@ because GitHub Actions runners are ephemeral (fresh filesystem every run).
 
 ## Reliability infrastructure (retry transport + watchdog)
 
-- **`deal_bot/transport.py`** is the single HTTP seam for every outbound call
-  (OpenRouter client, all Supabase storage, `run_log`, the weekly digest, and
-  the watchdog). `transport.request(method, url, ...)` retries network errors
-  and `{408,425,429,500,502,503,504}` with bounded backoff (default 3 attempts,
-  ~1s, ~2s), honors `Retry-After` on 429 **capped at `MAX_SLEEP_SECONDS` (30)**,
-  and never retries permanent 4xx. Callers use `from deal_bot import transport`
+- **`deal_bot/transport.py`** is the single HTTP seam for every outbound
+  call that is safe to auto-retry: the OpenRouter client, all Supabase
+  storage, `run_log`, the weekly digest, the watchdog, and the read-only
+  source GETs (Woot/Best Buy/Steam). `transport.request(method, url, ...)`
+  retries network errors and `{408,425,429,500,502,503,504}` with bounded
+  backoff (default 3 attempts, ~1s, ~2s), honors `Retry-After` on 429
+  **capped at `MAX_SLEEP_SECONDS` (30)**, and never retries permanent 4xx.
+  Callers use `from deal_bot import transport`
   + `transport.request(...)` (module-attribute access so tests can patch
-  `deal_bot.transport.request`).
+  `deal_bot.transport.request`). Discord webhook POSTs and Bluesky XRPC
+  posts are deliberately OUT of this layer — they are non-idempotent, so a
+  retried POST whose response was lost would double-post publicly; each
+  carries its own bounded loop instead.
 - **`load_seen` returns `dict | None`** — `None` on a hard fetch failure.
   `run_once()` treats that as fatal: it logs a clear `run_log` error and bails
   BEFORE fetching feeds, rather than running on an empty seen map (which would
@@ -343,11 +352,18 @@ instead of them). Now there's a stdlib `unittest` suite, no new dependency:
   and the weekly digest (bulk fetch/prune/seed/clear, retry behavior, dry-run,
   exit codes).
 - `tests/test_pipeline.py` — the phased pipeline: `_skip_reason` boundaries,
-  `run_once`'s `load_seen`-None bail, batch spec/analysis fallbacks.
+  `_enrich_with_price_history` strict-new-low/tie semantics, `run_once`'s
+  `load_seen`-None bail, batch spec/analysis fallbacks.
 - `tests/test_watchdog.py` — the dead-man's switch: freshness, staleness,
-  ordering of the `run_log` query.
+  ordering of the `run_log` query, no-config short-circuit.
+- `tests/test_sources.py` — Woot/Best Buy/Steam mapping + transport
+  integration, incl. the query-encoding regression tests.
+- `tests/test_discord_posting.py` / `tests/test_discord_embeds.py` — webhook
+  429 handling (incl. non-JSON bodies) and embed field-value capping.
+- `tests/test_bluesky.py` / `tests/test_display.py` / `tests/test_supabase.py`
+  — login-shape guard, shared price/discount formatting, explicit `posted_at`.
 
-**171 tests total**, run via `python -m unittest discover -s tests -p
+**277 tests total**, run via `python -m unittest discover -s tests -p
 "test_*.py"` (or `pytest tests/` if pytest happens to be installed locally —
 it isn't by default, and isn't a project dependency).
 
@@ -428,6 +444,39 @@ with the only symptom being an absence of activity, is exactly the failure mode
     `google/gemma-4-26b-a4b-it` fallback, wired as the fallback model in
     every Gemma-based feature.
 
+Bugs found and fixed in the 2026-08-22 code-review hardening pass:
+
+14. **Discord webhook non-JSON 429 crashed the posting loop** —
+    `_post_webhook` called `resp.json()` unguarded on 429; a Cloudflare/
+    proxy HTML body raised JSONDecodeError mid-loop, aborting the rest of
+    the run. Now falls back to a conservative 1s wait and retries.
+15. **Shadow embeds overflowed Discord's 1024-char field limit on big sale
+    days** — the categorizer/quality-scorer/classification reports joined
+    one line per posted deal uncapped; >~13 deals made Discord reject the
+    whole payload (400) and silently lose the report. All three builders
+    now route through `_join_capped()`, which greedily fits lines and
+    appends "…and N more".
+16. **Best Buy query encoding was broken** — `quote()` wrapped the whole
+    `search=...&onSale=true` expression, encoding the structural `&`/`=`.
+    Fixed to encode only the term; locked by regression tests (still needs
+    one live check once the API key arrives).
+17. **Bluesky login response shape was unvalidated** — a 200 response
+    missing/empty `accessJwt` or `did` would KeyError later mid-post.
+    `_bluesky_login` now validates both fields before caching, failing
+    open (no post attempted).
+18. **Watchdog false-alarmed hourly when Supabase config was missing** —
+    "no config" was indistinguishable from "no data/stale" and treated as
+    stale. It now short-circuits with a loud console message instead of
+    posting a false alarm.
+19. **`posted_at` went stale on re-post** — `record_posted_deal` upserts
+    with merge-duplicates but never sent `posted_at`, so a re-post after
+    seen_deals TTL pruning kept the original insert date and the weekly
+    digest window missed it. The row now carries an explicit UTC timestamp.
+20. **Import-time config binding** — `post_len.HARD_TARGET` and the
+    categorizer's category regex were computed at import, so monkeypatching
+    config (the project's own test convention) silently did nothing. Both
+    are now computed at call time (`hard_target()` / `_category_line_pattern()`).
+
 ## Design principles established (worth preserving)
 
 - **Verify against real data before declaring anything done** — this
@@ -457,10 +506,11 @@ with the only symptom being an absence of activity, is exactly the failure mode
 
 ## Open items / next steps
 
-- **Best Buy API key** — still pending approval as of last check. Once it
-  arrives: set `BESTBUY_API_KEY`, and specifically double-check bug #1 above
-  (the query-encoding issue) since it's never been exercised against a real
-  key.
+- **Best Buy API key** — still pending approval as of last check. The
+  query-encoding bug (#16) is now fixed and unit-tested, but it has still
+  never been exercised against a real key — do one live verification once
+  `BESTBUY_API_KEY` arrives, plus a re-check that `_redact()` doesn't leak
+  the key anywhere under real traffic.
 - **Shadow-feature promotion** — the classifier/scorer/categorizer are shadow
   mode until enough real-world runs are reviewed (the pipeline's phase split
   that promotion needs is already done). See BACKLOG.md §3.

@@ -1,4 +1,9 @@
-"""Discord posting — embed builders and webhook delivery."""
+"""Discord posting — embed builders and webhook delivery.
+
+Webhook POSTs deliberately bypass transport.request's auto-retry: they are
+non-idempotent (a retried POST whose response was lost would double-post
+the deal), so _post_webhook carries its own bounded loop that retries ONLY
+explicit rate-limit responses, never network errors."""
 
 import time
 from datetime import datetime, timezone
@@ -7,6 +12,35 @@ import requests
 
 from deal_bot import config
 from deal_bot.ai.captions import build_ai_caption
+
+
+def _join_capped(lines: list[str], cap: int = 1024) -> str:
+    """Join per-deal lines into one embed field value, never exceeding
+    Discord's 1024-char field limit. Greedily includes whole lines; when
+    lines had to be left out, appends a '…and N more' notice (reserving
+    room for it up front). A single line too large to fit even alone is
+    hard-truncated — the value is always returned, never raised."""
+    if not lines:
+        return ""
+    out: list[str] = []
+    total = 0
+    for line in lines:
+        extra = len(line) + (1 if out else 0)
+        if total + extra > cap - 20:  # reserve room for the omission notice
+            break
+        out.append(line)
+        total += extra
+    omitted = len(lines) - len(out)
+    if omitted > 0:
+        if out:
+            out.append(f"…and {omitted} more")
+        else:
+            # Even the first line didn't fit — truncate it so the field
+            # still carries something.
+            first = lines[0][:cap]
+            print(f"[discord] _join_capped: line truncated to {len(first)} chars")
+            return first
+    return "\n".join(out)
 
 
 def build_embed(deal: dict) -> dict:
@@ -130,7 +164,7 @@ def build_categorizer_embed(deals: list[dict], categories: dict[str, str], model
         f"`{categories.get(d['id'], '?')}` — [{d['title'][:55]}]({d['url']})"
         for d in deals
     ]
-    fields.append({"name": "Categories", "value": "\n".join(lines), "inline": False})
+    fields.append({"name": "Categories", "value": _join_capped(lines), "inline": False})
 
     return {
         "title": "🏷️ Category Tagger (Shadow Mode — nothing was actually routed)",
@@ -181,8 +215,8 @@ def build_shadow_classification_embed(keep: list[dict], drop: list[dict], model_
         {"name": "Model", "value": model_used, "inline": True},
     ]
     if drop:
-        lines = [f"[{d['title'][:70]}]({d['url']}) — {d['source']}" for d in drop[:10]]
-        fields.append({"name": "Would have dropped", "value": "\n".join(lines), "inline": False})
+        lines = [f"[{d['title'][:70]}]({d['url']}) — {d['source']}" for d in drop]
+        fields.append({"name": "Would have dropped", "value": _join_capped(lines), "inline": False})
 
     return {
         "title": "🔍 Desirability Classifier (Shadow Mode — nothing was actually withheld)",
@@ -211,7 +245,7 @@ def build_quality_scorer_embed(deals: list[dict], scores: dict[str, int], model_
         f"{scores.get(d['id'], '?')}/10 — [{d['title'][:60]}]({d['url']})"
         for d in deals
     ]
-    fields.append({"name": "Scores", "value": "\n".join(lines), "inline": False})
+    fields.append({"name": "Scores", "value": _join_capped(lines), "inline": False})
 
     return {
         "title": "🎯 Deal Quality Scorer (Shadow Mode — nothing was actually withheld)",
@@ -234,8 +268,14 @@ def _post_webhook(webhook_url: str, payload: dict, label: str) -> bool:
             return True
 
         if resp.status_code == 429:
-            retry_after = resp.json().get("retry_after", 1)
-            wait = float(retry_after) + 0.25  # small buffer past what Discord asks for
+            try:
+                retry_after = float(resp.json().get("retry_after", 1))
+            except (ValueError, TypeError):
+                # A 429 body that isn't Discord's JSON (e.g. a Cloudflare
+                # HTML page) must not crash the posting loop — fall back
+                # to a conservative 1s wait.
+                retry_after = 1.0
+            wait = retry_after + 0.25  # small buffer past what Discord asks for
             print(f"[discord:{label}] rate limited, waiting {wait:.2f}s (attempt {attempt}/{max_retries})")
             time.sleep(wait)
             continue

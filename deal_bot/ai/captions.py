@@ -4,6 +4,7 @@ import re
 
 from deal_bot import config
 from deal_bot.ai.client import _call_openrouter
+from deal_bot.display import discount_str, price_str
 from deal_bot.post_len import caption_budget
 
 _HASHTAG_PATTERN = re.compile(r"#(\w+)")
@@ -20,10 +21,8 @@ def build_x_caption_body(deal: dict) -> str:
     """Mechanical template body (no URL appended) — the same discount/price
     line build_x_caption() has always produced, split out so the Bluesky
     fitter can budget the URL separately."""
-    discount = f"{deal['discount_pct']}% off" if deal["discount_pct"] else "On sale"
-    price = f"${deal['sale_price']:.2f}"
-    if deal["list_price"]:
-        price += f" (was ${deal['list_price']:.2f})"
+    discount = discount_str(deal["discount_pct"])
+    price = price_str(deal["sale_price"], deal["list_price"])
     display_title = deal.get("clean_title") or deal["title"]
     return f"{discount} — {display_title} — {price}"
 
@@ -61,10 +60,8 @@ def build_ai_caption_body(deal: dict) -> str:
     specs, and price-history context from Supabase) so it acts as an
     analytical synthesizer of real data rather than an ungrounded
     copywriter — see config.OPENROUTER_CAPTION_SYSTEM_PROMPT."""
-    discount = f"{deal['discount_pct']}% off" if deal["discount_pct"] else "On sale"
-    price = f"${deal['sale_price']:.2f}"
-    if deal["list_price"]:
-        price += f" (was ${deal['list_price']:.2f})"
+    discount = discount_str(deal["discount_pct"])
+    price = price_str(deal["sale_price"], deal["list_price"])
     display_title = deal.get("clean_title") or deal["title"]
     specs = deal.get("specs") or []
 

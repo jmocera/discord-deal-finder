@@ -97,6 +97,12 @@ def record_posted_deal(deal: dict) -> None:
         "url": deal["url"],
         "sale_price": deal["sale_price"],
         "list_price": deal["list_price"],
+        # Explicit timestamp, not the column default: merge-duplicates
+        # overwrites every supplied column on conflict, and seen_deals
+        # TTL-prunes after SEEN_TTL_DAYS — so a re-post of the same deal ID
+        # must refresh posted_at or the weekly digest's time window would
+        # keep seeing only the original post date.
+        "posted_at": datetime.now(timezone.utc).isoformat(),
     }
     resp = transport.request("POST", url, headers=headers, json=[row])
     if resp is None:

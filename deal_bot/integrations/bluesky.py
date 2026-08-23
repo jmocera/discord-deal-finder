@@ -1,5 +1,10 @@
 """Bluesky posting — raw AT Protocol REST/XRPC calls (no SDK, consistent
-with the rest of the project's minimal-dependency approach)."""
+with the rest of the project's minimal-dependency approach).
+
+XRPC POSTs deliberately bypass transport.request's auto-retry:
+createRecord is non-idempotent, so a retried POST whose response was lost
+would duplicate the post publicly — these calls fail open (return False)
+instead of retrying."""
 
 from datetime import datetime, timezone
 
@@ -7,7 +12,8 @@ import requests
 
 from deal_bot import config
 from deal_bot.ai.captions import _HASHTAG_PATTERN, build_ai_caption_body
-from deal_bot.post_len import HARD_TARGET, fit_deal_post, truncate_to
+from deal_bot.display import price_str
+from deal_bot.post_len import fit_deal_post, hard_target, truncate_to
 
 _bluesky_session = None  # cached for the duration of one run, avoids re-login per post
 
@@ -29,6 +35,14 @@ def _bluesky_login() -> dict | None:
         print(f"[bluesky] login failed: {e}")
         return None
     _bluesky_session = resp.json()
+    # A 200 response with an unexpected shape (missing/empty accessJwt or
+    # did) would KeyError later mid-post — validate up front and fail open
+    # (no post attempted), never caching the unusable session.
+    if not (isinstance(_bluesky_session, dict)
+            and isinstance(_bluesky_session.get("accessJwt"), str) and _bluesky_session["accessJwt"]
+            and isinstance(_bluesky_session.get("did"), str) and _bluesky_session["did"]):
+        print(f"[bluesky] login response missing accessJwt/did — refusing to cache: {str(_bluesky_session)[:120]}")
+        _bluesky_session = None
     return _bluesky_session
 
 
@@ -102,9 +116,9 @@ def _build_bluesky_embed(session: dict, deal: dict) -> dict | None:
         print(f"[bluesky] unexpected uploadBlob response shape: {e}")
         return None
 
-    description = f"${deal['sale_price']:.2f}"
+    description = price_str(deal["sale_price"], deal["list_price"])
     if deal["list_price"]:
-        description = f"Now ${deal['sale_price']:.2f} (was ${deal['list_price']:.2f})"
+        description = f"Now {description}"
 
     return {
         "$type": "app.bsky.embed.external",
@@ -189,7 +203,7 @@ def post_text_to_bluesky(text: str) -> bool:
     if not session:
         return False
 
-    text = truncate_to(text, HARD_TARGET)
+    text = truncate_to(text, hard_target())
 
     record = {
         "$type": "app.bsky.feed.post",

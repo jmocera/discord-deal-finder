@@ -11,6 +11,7 @@ import re
 
 from deal_bot import config
 from deal_bot.ai.client import _call_openrouter
+from deal_bot.display import discount_str, price_str
 
 _BATCH_ANALYSIS_SYSTEM_PROMPT = """You write short expert analysis for a deal-finding bot aimed at PC builders and PC gamers. You'll be given a numbered list of deals, each with its source, item, known specs, discount, price, and optional price-history context. For each, write 2-3 concise sentences explaining what makes it genuinely noteworthy: what build or use case it fits, whether the price is strong for the specs given, and which spec(s) actually matter for that use case.
 
@@ -24,10 +25,8 @@ def _format_deal_lines(deal: dict) -> list[str]:
     """The per-deal context lines shared by the individual and batched
     prompts (clean title, specs, price, price-history signal), so both
     versions feed the model the exact same data."""
-    discount = f"{deal['discount_pct']}% off" if deal["discount_pct"] else "On sale"
-    price = f"${deal['sale_price']:.2f}"
-    if deal["list_price"]:
-        price += f" (was ${deal['list_price']:.2f})"
+    discount = discount_str(deal["discount_pct"])
+    price = price_str(deal["sale_price"], deal["list_price"])
     display_title = deal.get("clean_title") or deal["title"]
     specs = deal.get("specs") or []
 

@@ -2,12 +2,12 @@
 
 Woot's API is free (developer.woot.com) and rate-limited to 1 req/sec,
 burst 10, 1000/day — the pipeline sleeps 1.1s between feed requests to
-stay comfortably under that.
+stay comfortably under that. Read-only GET, so it goes through the shared
+transport (transient blips are retried instead of losing the whole feed
+for this run).
 """
 
-import requests
-
-from deal_bot import config
+from deal_bot import config, transport
 from deal_bot.sources.base import discount_percent
 
 
@@ -16,10 +16,10 @@ def fetch_woot_feed(feed_name: str) -> list[dict]:
         return []
     url = f"https://developer.woot.com/feed/{feed_name}"
     headers = {"Accept": "application/json", "x-api-key": config.WOOT_API_KEY}
-    try:
-        resp = requests.get(url, headers=headers, timeout=15)
-    except requests.RequestException as e:
-        print(f"[woot] request failed for feed '{feed_name}': {e}")
+    resp = transport.request("GET", url, headers=headers, timeout=15)
+
+    if resp is None:
+        print(f"[woot] feed '{feed_name}' failed after retries")
         return []
 
     if resp.status_code != 200:

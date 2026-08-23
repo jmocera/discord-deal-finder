@@ -47,8 +47,8 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-from deal_bot.ai.client import _call_openrouter
-from deal_bot.post_len import HARD_TARGET, fit_deal_post, truncate_to
+from deal_bot.ai.client import call_openrouter
+from deal_bot.post_len import fit_deal_post, hard_target, truncate_to
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -217,7 +217,7 @@ def _encode_image(path: Path) -> tuple[str, str] | None:
 # ---------------------------------------------------------------------------
 # OPENROUTER
 # ---------------------------------------------------------------------------
-# Shared client: `_call_openrouter` is imported from deal_bot.ai.client (the
+# Shared client: `call_openrouter` is imported from deal_bot.ai.client (the
 # single source of truth for the page URL, auth header, fail-open handling,
 # and code-fence stripping). Reasoning is deliberately never set for this
 # tool's models — the same "omit reasoning entirely" finding as
@@ -355,7 +355,7 @@ def format_bluesky_copy(vetted: dict) -> str:
     url = vetted.get("canonical_url")
     if url:
         return fit_deal_post(body, url)
-    return truncate_to(body, HARD_TARGET)
+    return truncate_to(body, hard_target())
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +369,7 @@ def _finalize_vetting(fields: dict, source_url: str | None) -> dict:
 
 
 def vet_from_text(raw_text: str, source_url: str | None = None) -> dict:
-    content = _call_openrouter(
+    content = call_openrouter(
         OPENROUTER_AMAZON_TEXT_MODEL, TEXT_SYSTEM_PROMPT, f"Page content:\n{raw_text[:8000]}",
         temperature=0.0, max_tokens=400, response_format={"type": "json_object"}, timeout=20,
     )
@@ -387,7 +387,7 @@ def vet_from_image(image_path: str, source_url: str | None = None) -> dict:
             {"type": "text", "text": "Screenshot of an Amazon product page:"},
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
         ]
-        content = _call_openrouter(
+        content = call_openrouter(
             OPENROUTER_AMAZON_VISION_MODEL, VISION_SYSTEM_PROMPT, user_content,
             temperature=0.0, max_tokens=400, response_format={"type": "json_object"}, timeout=30,
         )

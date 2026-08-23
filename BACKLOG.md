@@ -32,7 +32,8 @@ Status legend: `done` / `in-progress` / `blocked` / `backlog`.
 - **Shared retry/backoff transport** — `deal_bot/transport.py`, the single HTTP seam with bounded retry + `Retry-After` cap (commit `29712fa`, review-hardened in `6720615`).
 - **Watchdog heartbeat** — `watchdog.py` + hourly `watchdog.yml` (dead-man's switch).
 - **Phased pipeline + batched AI** — `_process_deals` split into explicit phases with a testable `_skip_reason`; spec + analysis run one batched call per phase.
-- **171 stdlib tests**, all passing.
+- **Code-review hardening pass (2026-08-22)** — six bug fixes (Discord non-JSON-429 crash, shadow-embed field overflow, Best Buy query encoding, Bluesky login-shape guard, watchdog false alarm on missing config, stale `posted_at` on re-post); source GETs moved onto the shared retry transport; call-time config binding (`post_len.hard_target()`, categorizer regex); new `deal_bot/display.py` shared price/discount formatting; strict new-low semantics with tie-keeps-date. See HANDOFF.md bugs #14–#20.
+- **277 stdlib tests**, all passing.
 
 ---
 
@@ -86,8 +87,9 @@ invisible lost deal).
 **Status:** blocked · **Owner:** user
 
 - Best Buy API key still pending approval.
-- Once it arrives: verify the long-dormant `quote()` query-encoding logic in
-  `sources/bestbuy.py` against a real key (it has never been exercised live).
+- The `quote()` query-encoding bug is now fixed and locked by regression
+  tests (`tests/test_sources.py`); still never exercised against a real
+  key — do one live verification when it arrives.
 - Re-check the key-redaction fix (`_redact()`) doesn't leak the key anywhere
   once real traffic flows.
 
@@ -111,13 +113,7 @@ invisible lost deal).
 
 **Status:** in-progress · **Owner:** user
 
-- **Shared retry/backoff transport** — done: `deal_bot/transport.py` is the
-  single seam for every outbound HTTP call (OpenRouter client, all Supabase
-  storage, run_log, weekly digest, watchdog). Bounded retries on network
-  errors + `{408,425,429,500,502,503,504}`, honors Retry-After, no retry on
-  permanent 4xx. Closes the double-post risk from a transient `load_seen`
-  failure (which now returns `None` — `run_once` bails and logs rather than
-  running on an empty seen map).
+- **Shared retry/backoff transport** — done: `deal_bot/transport.py` is the single seam for every outbound HTTP call that is safe to auto-retry (OpenRouter client, all Supabase storage, run_log, weekly digest, watchdog, and since the 2026-08-22 hardening pass the read-only Woot/Best Buy/Steam GETs). Discord webhook POSTs and Bluesky XRPC posts are deliberately excluded — non-idempotent POSTs must never be auto-retried (a lost response + retry = double-posted deal). Bounded retries on network errors + `{408,425,429,500,502,503,504}`, honors Retry-After, no retry on permanent 4xx. Closes the double-post risk from a transient `load_seen` failure (which now returns `None` — `run_once` bails and logs rather than running on an empty seen map).
 - **Watchdog heartbeat (dead-man's switch)** — done: `deal_bot/watchdog.py` +
   `.github/workflows/watchdog.yml` (hourly). Alerts if no `run_log` row lands
   within `max_hours` (default 6 = 2x the 4h cadence), covering the silently-
